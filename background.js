@@ -111,7 +111,49 @@ async function findClaudeTab(preferredTabId) {
   }
 
   const tabs = await chrome.tabs.query({ url: "https://claude.ai/*" });
-  return tabs[0]?.id ?? null;
+  if (!tabs.length) {
+    return null;
+  }
+
+  tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+  const active = tabs.find((t) => t.active);
+  return active?.id ?? tabs[0]?.id ?? null;
+}
+
+const CLAUDE_TAB_CONNECT_ERROR =
+  "Could not connect to Claude tab. Refresh claude.ai and try again.";
+
+async function pingContentScript(tabId) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { action: "ping" }, (response) => {
+      if (chrome.runtime.lastError || !response?.ok) {
+        resolve(false);
+        return;
+      }
+      resolve(true);
+    });
+  });
+}
+
+async function ensureContentScript(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!CLAUDE_URL_PATTERN.test(tab.url || "")) {
+    throw new Error(`tab is not a Claude page: ${tab.url || "unknown"}`);
+  }
+
+  if (await pingContentScript(tabId)) {
+    return;
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["banner.js", "content.js"],
+  });
+  await delay(100);
+
+  if (!(await pingContentScript(tabId))) {
+    throw new Error(CLAUDE_TAB_CONNECT_ERROR);
+  }
 }
 
 function notifyTab(tabId, payload, options = {}) {
@@ -267,7 +309,7 @@ const DEFAULT_EXPORT_INCLUDES = {
   transcript: true,
   artifacts: true,
   pasted: true,
-  thinking: false,
+  thinking: true,
 };
 
 function normalizeExportIncludes(includes) {
@@ -276,7 +318,7 @@ function normalizeExportIncludes(includes) {
     transcript: src.transcript !== false,
     artifacts: src.artifacts !== false,
     pasted: src.pasted !== false,
-    thinking: src.thinking === true,
+    thinking: src.thinking !== false,
   };
 }
 
@@ -1324,11 +1366,15 @@ async function runExportJob(request, tabId) {
       },
       tabId,
     );
-    notifyTab(tabId, {
-      action: "artifactsProcessed",
-      failure: true,
-      message: error.message,
-    });
+    notifyTab(
+      tabId,
+      {
+        action: "artifactsProcessed",
+        failure: true,
+        message: error.message,
+      },
+      { silent: true },
+    );
     throw error;
   }
 }
@@ -1477,9 +1523,20 @@ function getFileExtension(language) {
   return languageToExt[language.toLowerCase()] || ".txt";
 }
 
-chrome.tabs.onUpdated.addListener(function (tabId, changeInfo) {
-  if (changeInfo.url && CHAT_URL_PATTERN.test(changeInfo.url)) {
-    chrome.tabs.sendMessage(tabId, { action: "checkAndAddDownloadButton" });
+chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
+  const url = changeInfo.url || tab?.url;
+  if (
+    changeInfo.status === "complete" &&
+    url &&
+    CHAT_URL_PATTERN.test(url)
+  ) {
+    chrome.tabs.sendMessage(
+      tabId,
+      { action: "checkAndAddDownloadButton" },
+      () => {
+        void chrome.runtime.lastError;
+      },
+    );
   }
 });
 
@@ -1664,6 +1721,8 @@ function normalizeConversationSummary(conv) {
 }
 
 async function runPageBridge(tabId, bridgeMessage, injectFunc, args) {
+  await ensureContentScript(tabId);
+
   const tab = await chrome.tabs.get(tabId);
   if (!CLAUDE_URL_PATTERN.test(tab.url || "")) {
     throw new Error(`tab is not a Claude page: ${tab.url || "unknown"}`);
@@ -1680,7 +1739,12 @@ async function runPageBridge(tabId, bridgeMessage, injectFunc, args) {
       (response) => {
         clearTimeout(timeout);
         if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
+          const msg = chrome.runtime.lastError.message || "";
+          if (msg.includes("Receiving end does not exist")) {
+            reject(new Error(CLAUDE_TAB_CONNECT_ERROR));
+            return;
+          }
+          reject(new Error(msg));
           return;
         }
         resolve(response);

@@ -184,7 +184,7 @@ function createIncludesPanel() {
     { id: "transcript", label: "Transcript", defaultOn: true },
     { id: "artifacts", label: "Artifacts", defaultOn: true },
     { id: "pasted", label: "Pasted", defaultOn: true },
-    { id: "thinking", label: "Visible thinking", defaultOn: false },
+    { id: "thinking", label: "Visible thinking", defaultOn: true },
   ];
 
   for (const opt of options) {
@@ -210,7 +210,7 @@ function getExportIncludesFromPage() {
       document.querySelector(".claude-include-artifacts")?.checked ?? true,
     pasted: document.querySelector(".claude-include-pasted")?.checked ?? true,
     thinking:
-      document.querySelector(".claude-include-thinking")?.checked ?? false,
+      document.querySelector(".claude-include-thinking")?.checked ?? true,
   };
 }
 
@@ -228,12 +228,7 @@ function loadIncludePrefs() {
     };
     for (const [key, selector] of Object.entries(map)) {
       const el = document.querySelector(selector);
-      if (!el || includes[key] === undefined) {
-        continue;
-      }
-      if (key === "thinking") {
-        el.checked = includes.thinking === true;
-      } else {
+      if (el && includes[key] !== undefined) {
         el.checked = includes[key] !== false;
       }
     }
@@ -332,18 +327,31 @@ let thinkingObserver = null;
 let thinkingDebounceTimer = null;
 
 function flushThinkingCache() {
+  if (!chrome.runtime?.id) {
+    if (thinkingObserver) {
+      thinkingObserver.disconnect();
+      thinkingObserver = null;
+    }
+    return;
+  }
+
   const uuid = extractChatUuid(window.location.href);
   if (!uuid) {
     return;
   }
 
   const blocks = collectVisibleThinkingFromDom();
-  chrome.runtime.sendMessage({
-    action: "cacheVisibleThinking",
-    uuid,
-    blocks,
-    updatedAt: Date.now(),
-  });
+  chrome.runtime.sendMessage(
+    {
+      action: "cacheVisibleThinking",
+      uuid,
+      blocks,
+      updatedAt: Date.now(),
+    },
+    () => {
+      void chrome.runtime.lastError;
+    },
+  );
 }
 
 function scheduleThinkingCacheUpdate() {
@@ -442,9 +450,18 @@ function checkAndAddShareButtons() {
 }
 
 console.log(LOG_PREFIX, "content script loaded on", window.location.href);
-checkAndAddShareButtons();
+
+if (!(globalThis.__cadExportHubLoaded && chrome.runtime?.id)) {
+  globalThis.__cadExportHubLoaded = true;
+  checkAndAddShareButtons();
+}
 
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  if (request.action === "ping") {
+    sendResponse({ ok: !!chrome.runtime?.id });
+    return false;
+  }
+
   if (request.action === "listenForPayload") {
     const eventName = `cad-payload-${request.uuid}`;
     console.log(LOG_PREFIX, "listening for page payload event:", eventName);

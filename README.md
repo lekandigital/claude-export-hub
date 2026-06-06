@@ -1,6 +1,6 @@
 # Claude Export Hub
 
-Chrome extension for exporting Claude.ai conversations — transcripts, artifacts, pasted content, attachment excerpts, and optional visible thinking — as organized ZIP archives. All processing runs locally in your browser.
+Chrome extension for exporting Claude.ai conversations — transcripts, artifacts, pasted content, attachment excerpts, and visible thinking (toggleable per export) — as organized ZIP archives. All processing runs locally in your browser.
 
 ## What it does
 
@@ -21,7 +21,7 @@ Each export uses checkboxes:
 - **Transcript** — full conversation as `chat.md` (on by default)
 - **Artifacts** — Claude `<antArtifact>` files in `artifacts/` (on by default)
 - **Pasted** — long pasted human messages in `pasted/` (on by default)
-- **Visible thinking** — thinking Claude shows in the chat UI, in `thinking/` (off by default)
+- **Visible thinking** — thinking Claude shows in the chat UI, in `thinking/` (on by default)
 
 Export is blocked if no content type is selected.
 
@@ -60,8 +60,15 @@ Attachment and content-block excerpts are included **inline in `chat.md`** (quot
 
 - Claude's UI and API can change without notice; exports may need updates
 - Attachments may appear as extracted text in `chat.md` depending on Claude's payload shape
+- Visible thinking export captures what Claude shows in the UI, not hidden or encrypted reasoning
 - Large bulk exports can take time; progress and cancel are available in the popup
 - Not affiliated with or endorsed by Anthropic
+
+## Troubleshooting
+
+- **"Could not connect to Claude tab"** — After reloading the extension, refresh any open claude.ai tabs and try again. Bulk exports (Pick chats / All chats) need an open Claude tab; the extension will reconnect automatically when possible.
+- **No thinking/ folder** — Uncheck/re-check **Visible thinking**, expand thinking sections in the chat, then re-export. Redacted or omitted thinking cannot be recovered.
+- **Export seems stuck** — Use Cancel in the popup; large All chats exports can take several minutes.
 
 ## Installation
 
@@ -74,7 +81,7 @@ Attachment and content-block excerpts are included **inline in `chat.md`** (quot
 
 This project began as a fork of [ashwanthkumar/claude-artifacts-downloader](https://github.com/ashwanthkumar/claude-artifacts-downloader), an MIT-licensed Chrome extension for downloading Claude artifacts from a conversation.
 
-Claude Export Hub significantly extends that original idea with multi-chat export, selected-chat export, all-chat export, per-chat folder organization, transcript export, pasted-content export, attachment/content-block handling, and a redesigned export workflow.
+Claude Export Hub significantly extends that original idea with multi-chat export, selected-chat export, all-chat export, per-chat folder organization, transcript export, pasted-content export, visible thinking export, attachment/content-block handling, and a redesigned export workflow.
 
 Portions of the original extension structure and artifact extraction approach are derived from `claude-artifacts-downloader`. The original MIT license and copyright notice are preserved in [LICENSE](LICENSE) and [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
 

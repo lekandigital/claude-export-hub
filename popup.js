@@ -107,7 +107,7 @@ async function loadPrefs() {
     includeTranscript.checked = prefs.includes.transcript !== false;
     includeArtifacts.checked = prefs.includes.artifacts !== false;
     includePasted.checked = prefs.includes.pasted !== false;
-    includeThinking.checked = prefs.includes.thinking === true;
+    includeThinking.checked = prefs.includes.thinking !== false;
   }
   if (prefs.activeTab) {
     switchTab(prefs.activeTab, false);
