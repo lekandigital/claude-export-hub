@@ -1,12 +1,16 @@
 // background.js
 importScripts("jszip.min.js");
 
-const LOG_PREFIX = "[Claude Artifact Downloader]";
+const LOG_PREFIX = "[Claude Export Hub]";
 const CHAT_URL_PATTERN = /^https:\/\/claude\.ai\/chat\/[^/]+/;
+const CLAUDE_URL_PATTERN = /^https:\/\/claude\.ai/;
 const ORG_API_URLS = [
   "https://claude.ai/api/organizations",
   "https://api.claude.ai/api/organizations",
 ];
+const EXPORT_JOB_KEY = "exportJob";
+const CHAT_FETCH_DELAY_MS = 150;
+const LIST_PAGE_SIZE = 50;
 
 function collectChatOrgIds(data) {
   const orgs = Array.isArray(data)
@@ -20,12 +24,16 @@ function collectChatOrgIds(data) {
     .map((org) => org.uuid || org.id)
     .filter(Boolean);
 }
+
 const API_HOSTS = ["https://claude.ai", "https://api.claude.ai"];
 
 const CONVERSATION_PARAM_SETS = [
   { tree: "True", rendering_mode: "messages", render_all_tools: "true" },
   { tree: "True", rendering_mode: "raw" },
 ];
+
+let jobCancelRequested = false;
+let activeJobPromise = null;
 
 function getActiveFetchHeaders(uuid) {
   return {
@@ -37,30 +45,87 @@ function getActiveFetchHeaders(uuid) {
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action !== "downloadArtifacts") {
+  if (request.action === "downloadArtifacts") {
+    handleDownloadArtifacts(request, sender)
+      .then((result) => sendResponse({ success: true, ...result }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (request.action === "listConversations") {
+    handleListConversations(request, sender)
+      .then((result) => sendResponse({ success: true, ...result }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (request.action === "startExportJob") {
+    handleStartExportJob(request, sender)
+      .then((result) => sendResponse({ success: true, ...result }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (request.action === "getExportJobStatus") {
+    getExportJob()
+      .then((job) => sendResponse({ success: true, job }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (request.action === "cancelExportJob") {
+    jobCancelRequested = true;
+    getExportJob().then((job) => {
+      if (job?.status === "running") {
+        setExportJob({ ...job, status: "cancelling" });
+      }
+    });
+    sendResponse({ success: true });
     return false;
   }
 
-  handleDownloadArtifacts(request, sender)
-    .then((result) => sendResponse({ success: true, ...result }))
-    .catch((err) => sendResponse({ success: false, error: err.message }));
-
-  return true;
+  return false;
 });
 
 function getTabId(sender, request) {
   return request.tabId ?? sender.tab?.id;
 }
 
-function notifyTab(tabId, payload) {
+async function findClaudeTab(preferredTabId) {
+  if (preferredTabId) {
+    try {
+      const tab = await chrome.tabs.get(preferredTabId);
+      if (CLAUDE_URL_PATTERN.test(tab.url || "")) {
+        return tab.id;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const tabs = await chrome.tabs.query({ url: "https://claude.ai/*" });
+  return tabs[0]?.id ?? null;
+}
+
+function notifyTab(tabId, payload, options = {}) {
   if (!tabId) {
     return;
   }
   chrome.tabs.sendMessage(tabId, payload, () => {
-    if (chrome.runtime.lastError) {
-      console.warn(LOG_PREFIX, "Could not notify tab:", chrome.runtime.lastError.message);
+    if (chrome.runtime.lastError && !options.silent) {
+      console.warn(
+        LOG_PREFIX,
+        "Could not notify tab:",
+        chrome.runtime.lastError.message,
+      );
     }
   });
+}
+
+function broadcastExportProgress(job) {
+  chrome.runtime
+    .sendMessage({ action: "exportProgress", job })
+    .catch(() => {});
 }
 
 function sanitizeFilename(name) {
@@ -111,13 +176,26 @@ function getLastOrgId() {
   });
 }
 
+function getExportJob() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([EXPORT_JOB_KEY], (result) => {
+      resolve(result[EXPORT_JOB_KEY] ?? null);
+    });
+  });
+}
+
+function setExportJob(job) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [EXPORT_JOB_KEY]: job }, resolve);
+  });
+}
+
+function isStorableChatPayload(resp) {
+  return !!(resp && resp.uuid && Array.isArray(resp.chat_messages));
+}
+
 function isValidChatPayload(resp) {
-  return !!(
-    resp &&
-    resp.uuid &&
-    Array.isArray(resp.chat_messages) &&
-    resp.chat_messages.length > 0
-  );
+  return isStorableChatPayload(resp) && resp.chat_messages.length > 0;
 }
 
 async function storeChatPayload(resp) {
@@ -151,7 +229,9 @@ function parseChatConversationRequest(obj) {
     if (!url.pathname.includes("chat_conversations")) {
       return null;
     }
-    const uuidMatch = url.pathname.match(/chat_conversations\/([0-9a-f-]{36})/i);
+    const uuidMatch = url.pathname.match(
+      /\/chat_conversations\/([0-9a-f-]{36})\/?$/i,
+    );
     if (!uuidMatch) {
       return null;
     }
@@ -172,136 +252,857 @@ function buildRawConversationUrl(urlString) {
   return url.toString();
 }
 
-async function handleDownloadArtifacts(request, sender) {
-  const tabId = getTabId(sender, request);
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  if (!request.uuid) {
-    const msg = "No conversation UUID found.";
-    notifyTab(tabId, { action: "artifactsProcessed", failure: true, message: msg });
-    throw new Error(msg);
+const DEFAULT_EXPORT_INCLUDES = {
+  transcript: true,
+  artifacts: true,
+  pasted: true,
+};
+
+function normalizeExportIncludes(includes) {
+  const src = includes || {};
+  return {
+    transcript: src.transcript !== false,
+    artifacts: src.artifacts !== false,
+    pasted: src.pasted !== false,
+  };
+}
+
+function hasAnyExportInclude(includes) {
+  return includes.transcript || includes.artifacts || includes.pasted;
+}
+
+function resolveExportIncludes(request) {
+  if (request.exportIncludes) {
+    return normalizeExportIncludes(request.exportIncludes);
   }
 
-  console.log(LOG_PREFIX, "download requested for", request.uuid);
-  const { payload, error: fetchError } = await ensureChatPayload(
-    request.uuid,
-    tabId,
+  const filter = request.contentFilter;
+  if (filter === "artifacts") {
+    return { transcript: false, artifacts: true, pasted: false };
+  }
+  if (filter === "pasted") {
+    return { transcript: false, artifacts: false, pasted: true };
+  }
+  if (filter === "attachments") {
+    return { transcript: true, artifacts: false, pasted: false };
+  }
+
+  return { ...DEFAULT_EXPORT_INCLUDES };
+}
+
+function createChatSkipRecord(chatUuid, chatName, reason) {
+  return {
+    type: "chat",
+    chatUuid,
+    chatName,
+    label: chatName,
+    reason,
+  };
+}
+
+function createCategorySkipRecord(payload, type, reason) {
+  const labels = {
+    transcript: "Transcript",
+    artifacts: "Artifacts",
+    pasted: "Pasted",
+  };
+  return {
+    type,
+    chatUuid: payload.uuid,
+    chatName: payload.name || "Untitled",
+    label: labels[type] || type,
+    reason,
+  };
+}
+
+function formatFolderSkipReportText(skipped) {
+  return skipped.map((skip) => `${skip.label} — ${skip.reason}`).join("\n");
+}
+
+function formatSkipReportText(skipped) {
+  return skipped
+    .map((skip) => {
+      if (skip.type === "chat") {
+        return `Chat: ${skip.chatName}\nReason: ${skip.reason}`;
+      }
+      return `[${skip.chatName}] ${skip.label} — ${skip.reason}`;
+    })
+    .join("\n\n---\n\n");
+}
+
+function summarizeFetchError(errors) {
+  const fragments = errors
+    .filter(Boolean)
+    .join("; ")
+    .split("; ")
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (fragments.some((part) => part.includes("unusable payload"))) {
+    return "Conversation has no messages or could not be loaded";
+  }
+
+  const httpFragment = fragments.find((part) => /HTTP \d{3}/.test(part));
+  if (httpFragment) {
+    const status = httpFragment.match(/HTTP (\d{3})/)?.[1];
+    if (status === "403") {
+      return "Access denied (HTTP 403)";
+    }
+    if (status === "404") {
+      return "Conversation not found (HTTP 404)";
+    }
+    return `HTTP ${status} while fetching conversation`;
+  }
+
+  if (
+    fragments.some(
+      (part) =>
+        part.includes("HTTP or network error") ||
+        part.toLowerCase().includes("network error"),
+    )
+  ) {
+    return "Network error while fetching conversation";
+  }
+
+  if (fragments.some((part) => part.includes("no chat-capable organizations"))) {
+    return "Could not find a chat-capable organization";
+  }
+
+  if (fragments.some((part) => part.includes("timed out"))) {
+    return "Fetch timed out";
+  }
+
+  return "Could not fetch conversation";
+}
+
+function getChatLevelSkips(skipped) {
+  return skipped.filter((skip) => skip.type === "chat");
+}
+
+function formatSkipSummary(chatCount, totalFiles, skipped) {
+  const header = `${chatCount} chat${chatCount === 1 ? "" : "s"}, ${totalFiles} file${totalFiles === 1 ? "" : "s"} exported.`;
+  if (!skipped.length) {
+    return header;
+  }
+  if (totalFiles === 0) {
+    return "Nothing exported. Skipped items are described in export-skipped.txt.";
+  }
+  return `${header} Skipped items are described in the export.`;
+}
+
+function isTrivialTranscript(markdown, chatName) {
+  const stripped = markdown.trim();
+  const headerOnly = `# ${chatName}`.trim();
+  return (
+    !stripped ||
+    stripped === headerOnly ||
+    stripped === `${headerOnly}\n` ||
+    stripped.replace(/\s/g, "") === headerOnly.replace(/\s/g, "")
   );
-  if (!payload) {
-    const msg = `Could not fetch Claude conversation payload. Open the extension service worker console and check the active-fetch logs. Last error: ${fetchError || "unknown"}`;
-    notifyTab(tabId, { action: "artifactsProcessed", failure: true, message: msg });
-    throw new Error(msg);
+}
+
+function showExportNotification(message) {
+  if (!chrome.notifications?.create) {
+    return;
   }
 
-  if (!payload.chat_messages || payload.chat_messages.length === 0) {
-    const msg = "No chat messages found in cached payload.";
-    notifyTab(tabId, { action: "artifactsProcessed", failure: true, message: msg });
-    throw new Error(msg);
-  }
+  const shortMessage = message.split("\n")[0];
 
-  const chatData = payload;
-  const zip = new JSZip();
-  let artifactCount = 0;
-  const usedNames = new Set();
+  const iconUrl = chrome.runtime.getURL("icon48.png");
 
+  chrome.notifications.create(
+    `export-${Date.now()}`,
+    {
+      type: "basic",
+      iconUrl,
+      title: "Claude export complete",
+      message: shortMessage,
+    },
+    () => {
+      if (chrome.runtime.lastError) {
+        console.warn(
+          LOG_PREFIX,
+          "Notification skipped:",
+          chrome.runtime.lastError.message,
+        );
+      }
+    },
+  );
+}
+
+function getMostRecentRootMessage(payload) {
   const rootMessages = payload.chat_messages.filter(
     (message) =>
       message.parent_message_uuid === "00000000-0000-4000-8000-000000000000",
   );
+  if (rootMessages.length === 0) {
+    return null;
+  }
+  return rootMessages.reduce((latest, current) => {
+    return new Date(current.updated_at) > new Date(latest.updated_at)
+      ? current
+      : latest;
+  });
+}
 
-  let mostRecentRootMessage = null;
-  if (rootMessages.length > 0) {
-    mostRecentRootMessage = rootMessages.reduce((latest, current) => {
-      return new Date(current.updated_at) > new Date(latest.updated_at)
-        ? current
-        : latest;
-    });
+function buildChatFolderPrefix(payload) {
+  const shortId = payload.uuid.slice(0, 8);
+  return `${sanitizeFilename(payload.name || "chat")}_${shortId}/`;
+}
+
+function getActiveBranchMessages(payload) {
+  const messages = payload.chat_messages || [];
+  const byUuid = new Map(messages.map((m) => [m.uuid, m]));
+  const nilUuid = "00000000-0000-4000-8000-000000000000";
+  const leafUuid = payload.current_leaf_message_uuid;
+
+  if (!leafUuid || !byUuid.has(leafUuid)) {
+    const root = getMostRecentRootMessage(payload);
+    if (!root) {
+      return [];
+    }
+    const branch = [];
+    let node = root;
+    while (node) {
+      branch.push(node);
+      const children = messages
+        .filter((m) => m.parent_message_uuid === node.uuid)
+        .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+      node = children.length ? children[children.length - 1] : null;
+    }
+    return branch;
   }
 
-  const useDirectoryStructure = request.useDirectoryStructure;
+  const branch = [];
+  let current = byUuid.get(leafUuid);
+  while (current) {
+    branch.push(current);
+    const parentUuid = current.parent_message_uuid;
+    if (!parentUuid || parentUuid === nilUuid) {
+      break;
+    }
+    current = byUuid.get(parentUuid);
+    if (!current) {
+      break;
+    }
+  }
+  return branch.reverse();
+}
 
-  if (mostRecentRootMessage) {
-    artifactCount = processMessage(
-      mostRecentRootMessage,
-      payload,
-      zip,
-      usedNames,
-      0,
-      useDirectoryStructure,
-    );
+function stripArtifactsFromText(text) {
+  return text
+    .replace(/<antArtifact[^>]*>[\s\S]*?<\/antArtifact>/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function getAttachmentExcerpts(message) {
+  const excerpts = [];
+  const sources = [
+    ...(message.attachments || []),
+    ...(message.files || []),
+    ...(message.files_v2 || []),
+  ];
+  for (const att of sources) {
+    const content = att.extracted_content || att.content;
+    if (typeof content === "string" && content.trim()) {
+      const name = att.file_name || att.filename || att.name || "attachment";
+      excerpts.push({ name, content: content.trim() });
+    }
+  }
+  if (Array.isArray(message.content)) {
+    for (const block of message.content) {
+      const blockBody =
+        block.text ||
+        block.content ||
+        block.source?.data ||
+        block.document?.content;
+      if (
+        block.type &&
+        block.type !== "text" &&
+        block.type !== "thinking" &&
+        typeof blockBody === "string" &&
+        blockBody.trim().length > 80
+      ) {
+        excerpts.push({
+          name: block.title || block.name || block.type,
+          content: blockBody.trim(),
+        });
+      }
+    }
+  }
+  return excerpts;
+}
+
+function buildChatMarkdown(payload) {
+  const messages = getActiveBranchMessages(payload);
+  const lines = [`# ${payload.name || "Untitled Chat"}`, ""];
+
+  for (const message of messages) {
+    const sender = message.sender === "human" ? "Human" : "Assistant";
+    const timestamp = message.created_at
+      ? new Date(message.created_at).toLocaleString()
+      : "";
+    lines.push(`### ${sender}${timestamp ? ` — ${timestamp}` : ""}`, "");
+
+    const text = stripArtifactsFromText(getMessageText(message));
+    if (text) {
+      lines.push(text, "");
+    }
+
+    for (const att of getAttachmentExcerpts(message)) {
+      lines.push(`> **Attachment: ${att.name}**`, "");
+      for (const line of att.content.split("\n")) {
+        lines.push(`> ${line}`);
+      }
+      lines.push("");
+    }
   }
 
-  if (artifactCount === 0 && tabId) {
-    console.log(
-      LOG_PREFIX,
-      "no export items in cached payload; trying raw-mode supplement",
-    );
-    const rawSupplement = await fetchPayloadViaPageEventBridge(
-      tabId,
-      request.uuid,
-      { rawOnly: true },
-    );
-    if (rawSupplement.payload && mostRecentRootMessage) {
-      artifactCount = processMessage(
-        mostRecentRootMessage,
-        rawSupplement.payload,
-        zip,
-        usedNames,
-        0,
-        useDirectoryStructure,
+  return `${lines.join("\n").trim()}\n`;
+}
+
+function collectCategorizedItemsFromPayload(payload) {
+  const messages = getActiveBranchMessages(payload);
+  const artifacts = [];
+  const pasted = [];
+  const seenArtifacts = new Set();
+  const seenPasted = new Set();
+
+  function addArtifact(item, messageIndex) {
+    const key = `${item.title}::${item.content.slice(0, 120)}`;
+    if (seenArtifacts.has(key)) {
+      return;
+    }
+    seenArtifacts.add(key);
+    artifacts.push({ ...item, messageIndex });
+  }
+
+  function addPasted(item, messageIndex) {
+    const key = `${item.title}::${item.content.slice(0, 120)}`;
+    if (seenPasted.has(key)) {
+      return;
+    }
+    seenPasted.add(key);
+    pasted.push({ ...item, messageIndex });
+  }
+
+  for (const message of messages) {
+    const text = getMessageText(message);
+    const index = message.index ?? 0;
+
+    for (const artifact of extractArtifacts(text)) {
+      addArtifact(artifact, index);
+    }
+
+    if (Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block.type === "text" && block.text) {
+          for (const artifact of extractArtifacts(block.text)) {
+            addArtifact(artifact, index);
+          }
+        }
+      }
+    }
+
+    if (message.sender === "human" && text.trim().length > 80) {
+      addPasted(
+        {
+          title: inferPastedTitle(text, "human"),
+          language: "markdown",
+          content: text.trim(),
+        },
+        index,
       );
-      if (artifactCount > 0) {
+    }
+  }
+
+  return { artifacts, pasted };
+}
+
+function writeStructuredChatToZip(zip, payload, exportIncludes, folderPrefix) {
+  let fileCount = 0;
+  const skipped = [];
+  const chatName = payload.name || "Untitled";
+  const messages = getActiveBranchMessages(payload);
+  const { artifacts, pasted } = collectCategorizedItemsFromPayload(payload);
+
+  if (exportIncludes.transcript) {
+    if (messages.length === 0) {
+      skipped.push(
+        createCategorySkipRecord(
+          payload,
+          "transcript",
+          "No messages on active branch",
+        ),
+      );
+    } else {
+      const markdown = buildChatMarkdown(payload);
+      if (isTrivialTranscript(markdown, chatName)) {
+        skipped.push(
+          createCategorySkipRecord(payload, "transcript", "Transcript content is empty"),
+        );
+      } else {
+        zip.file(`${folderPrefix}chat.md`, markdown);
+        fileCount++;
+      }
+    }
+  }
+
+  if (exportIncludes.artifacts) {
+    if (artifacts.length === 0) {
+      skipped.push(
+        createCategorySkipRecord(payload, "artifacts", "No artifacts found"),
+      );
+    } else {
+      const usedNames = new Set();
+      for (const item of artifacts) {
+        const fileName = getUniqueFileName(
+          item.title,
+          item.language,
+          item.messageIndex,
+          usedNames,
+        );
+        zip.file(`${folderPrefix}artifacts/${fileName}`, item.content);
+        fileCount++;
+      }
+    }
+  }
+
+  if (exportIncludes.pasted) {
+    if (pasted.length === 0) {
+      skipped.push(
+        createCategorySkipRecord(
+          payload,
+          "pasted",
+          "No pasted messages over 80 characters",
+        ),
+      );
+    } else {
+      const usedNames = new Set();
+      for (const item of pasted) {
+        const fileName = getUniqueFileName(
+          item.title,
+          item.language,
+          item.messageIndex,
+          usedNames,
+        );
+        zip.file(`${folderPrefix}pasted/${fileName}`, item.content);
+        fileCount++;
+      }
+    }
+  }
+
+  if (skipped.length > 0) {
+    zip.file(
+      `${folderPrefix}skipped.txt`,
+      formatFolderSkipReportText(skipped),
+    );
+    fileCount++;
+  }
+
+  return { fileCount, skipped };
+}
+
+async function addChatToZip(zip, payload, options) {
+  const { exportIncludes, tabId, uuid, tryRawSupplement = false } = options;
+  const folderPrefix = buildChatFolderPrefix(payload);
+
+  let result = writeStructuredChatToZip(
+    zip,
+    payload,
+    exportIncludes,
+    folderPrefix,
+  );
+
+  if (result.fileCount === 0 && tryRawSupplement && tabId && uuid) {
+    const rawSupplement = await fetchPayloadViaPageEventBridge(tabId, uuid, {
+      rawOnly: true,
+    });
+    if (rawSupplement.payload) {
+      result = writeStructuredChatToZip(
+        zip,
+        rawSupplement.payload,
+        exportIncludes,
+        folderPrefix,
+      );
+      if (result.fileCount > 0) {
         await storeChatPayload(rawSupplement.payload);
       }
     }
   }
 
-  if (artifactCount === 0) {
-    const msg =
-      "No exportable content found (artifacts, pasted text, or attachments).";
-    notifyTab(tabId, {
-      action: "artifactsProcessed",
-      success: true,
-      message: msg,
-    });
-    return { message: msg, artifactCount: 0 };
+  return result;
+}
+
+async function downloadZip(zip, filename) {
+  const base64 = await zip.generateAsync({ type: "base64" });
+  const url = `data:application/zip;base64,${base64}`;
+
+  await new Promise((resolve, reject) => {
+    chrome.downloads.download(
+      {
+        url,
+        filename,
+        saveAs: true,
+      },
+      (downloadId) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(downloadId);
+        }
+      },
+    );
+  });
+}
+
+async function updateJobProgress(partial, tabId) {
+  const current = (await getExportJob()) || {};
+  const job = { ...current, ...partial };
+  await setExportJob(job);
+  broadcastExportProgress(job);
+  if (tabId) {
+    notifyTab(tabId, { action: "exportProgress", job }, { silent: true });
+  }
+  return job;
+}
+
+function buildConversationNameMap(conversations) {
+  const nameByUuid = new Map();
+  for (const conv of conversations) {
+    if (conv?.uuid) {
+      nameByUuid.set(conv.uuid, conv.name || "Untitled");
+    }
+  }
+  return nameByUuid;
+}
+
+async function resolveChatDisplayName(uuid, payload, nameByUuid) {
+  if (payload?.name) {
+    return payload.name;
+  }
+  if (nameByUuid.has(uuid)) {
+    return nameByUuid.get(uuid);
+  }
+  const cached = await getStoragePayload(uuid);
+  if (cached?.name) {
+    return cached.name;
+  }
+  return "Untitled";
+}
+
+async function resolveUuidList(request, tabId) {
+  const scope = request.scope || "current";
+
+  if (scope === "selected") {
+    if (!request.uuids?.length) {
+      throw new Error("No conversations selected.");
+    }
+    const list = await fetchAllConversations(tabId);
+    return {
+      uuids: request.uuids,
+      nameByUuid: buildConversationNameMap(list),
+    };
   }
 
-  try {
-    const base64 = await zip.generateAsync({ type: "base64" });
-    await new Promise((resolve, reject) => {
-      chrome.downloads.download(
-        {
-          url: `data:application/zip;base64,${base64}`,
-          filename: `${sanitizeFilename(chatData.name)}.zip`,
-          saveAs: true,
-        },
-        (downloadId) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-          } else {
-            resolve(downloadId);
-          }
-        },
-      );
-    });
+  if (scope === "all") {
+    const list = await fetchAllConversations(tabId);
+    if (!list.length) {
+      throw new Error("No conversations found.");
+    }
+    return {
+      uuids: list.map((c) => c.uuid),
+      nameByUuid: buildConversationNameMap(list),
+    };
+  }
 
-    const msg = `${artifactCount} artifacts downloaded successfully.`;
+  if (!request.uuid) {
+    throw new Error("No conversation UUID found.");
+  }
+  return { uuids: [request.uuid], nameByUuid: new Map() };
+}
+
+async function runExportJob(request, tabId) {
+  jobCancelRequested = false;
+  const exportIncludes = resolveExportIncludes(request);
+  if (!hasAnyExportInclude(exportIncludes)) {
+    throw new Error("Select at least one content type to export.");
+  }
+
+  const job = {
+    status: "running",
+    phase: "listing",
+    current: 0,
+    total: 0,
+    currentChatName: "",
+    fileCount: 0,
+    chatCount: 0,
+    skipped: [],
+    errors: [],
+    startedAt: Date.now(),
+    finishedAt: null,
+    message: "",
+  };
+  await setExportJob(job);
+  broadcastExportProgress(job);
+
+  try {
+    const { uuids, nameByUuid } = await resolveUuidList(request, tabId);
+
+    await updateJobProgress(
+      { phase: "fetching", total: uuids.length, current: 0 },
+      tabId,
+    );
+
+    const zip = new JSZip();
+    let totalFiles = 0;
+    let chatCount = 0;
+    const skipped = [];
+
+    for (let i = 0; i < uuids.length; i++) {
+      if (jobCancelRequested) {
+        break;
+      }
+
+      const uuid = uuids[i];
+      const { payload, error: fetchError } = await ensureChatPayload(
+        uuid,
+        tabId,
+      );
+
+      const chatName = await resolveChatDisplayName(uuid, payload, nameByUuid);
+      await updateJobProgress(
+        {
+          current: i + 1,
+          currentChatName: chatName,
+        },
+        tabId,
+      );
+
+      if (!payload) {
+        skipped.push(
+          createChatSkipRecord(
+            uuid,
+            chatName,
+            fetchError || "fetch failed",
+          ),
+        );
+        await delay(CHAT_FETCH_DELAY_MS);
+        continue;
+      }
+
+      const { fileCount, skipped: chatSkips } = await addChatToZip(zip, payload, {
+        exportIncludes,
+        tabId,
+        uuid,
+        tryRawSupplement: true,
+      });
+
+      skipped.push(...chatSkips);
+
+      if (fileCount === 0) {
+        const reason = !payload.chat_messages?.length
+          ? "Conversation has no messages"
+          : "No exportable content for selected options";
+        skipped.push(
+          createChatSkipRecord(uuid, payload.name || chatName, reason),
+        );
+      } else {
+        totalFiles += fileCount;
+        chatCount++;
+      }
+
+      await delay(CHAT_FETCH_DELAY_MS);
+    }
+
+    if (jobCancelRequested) {
+      await updateJobProgress(
+        {
+          status: "cancelled",
+          phase: "done",
+          skipped,
+          fileCount: totalFiles,
+          chatCount,
+          finishedAt: Date.now(),
+          message: "Export cancelled.",
+        },
+        tabId,
+      );
+      return {
+        cancelled: true,
+        message: "Export cancelled.",
+        artifactCount: totalFiles,
+        chatCount,
+        skipped,
+      };
+    }
+
+    if (totalFiles === 0) {
+      const msg = formatSkipSummary(0, 0, skipped);
+      const chatSkips = getChatLevelSkips(skipped);
+
+      if (chatSkips.length > 0) {
+        await updateJobProgress({ phase: "zipping" }, tabId);
+        const emptyZip = new JSZip();
+        emptyZip.file("export-skipped.txt", formatSkipReportText(chatSkips));
+        const date = new Date().toISOString().slice(0, 10);
+        await updateJobProgress({ phase: "downloading" }, tabId);
+        await downloadZip(emptyZip, `claude-export-${date}.zip`);
+      }
+
+      await updateJobProgress(
+        {
+          status: "done",
+          phase: "done",
+          skipped,
+          skipSummary: msg,
+          fileCount: 0,
+          chatCount: 0,
+          finishedAt: Date.now(),
+          message: msg,
+        },
+        tabId,
+      );
+      notifyTab(tabId, {
+        action: "artifactsProcessed",
+        success: true,
+        message: msg,
+      });
+      if (chatSkips.length > 0) {
+        showExportNotification(msg);
+      }
+      return { message: msg, artifactCount: 0, chatCount: 0, skipped };
+    }
+
+    await updateJobProgress({ phase: "zipping" }, tabId);
+
+    const chatSkips = getChatLevelSkips(skipped);
+    if (chatSkips.length > 0) {
+      zip.file("export-skipped.txt", formatSkipReportText(chatSkips));
+    }
+
+    const scope = request.scope || "current";
+    let filename;
+    if (scope === "current" && uuids.length === 1) {
+      const cached = await getStoragePayload(uuids[0]);
+      filename = `${sanitizeFilename(cached?.name || "claude-export")}.zip`;
+    } else {
+      const date = new Date().toISOString().slice(0, 10);
+      filename = `claude-export-${date}.zip`;
+    }
+
+    await updateJobProgress({ phase: "downloading" }, tabId);
+    await downloadZip(zip, filename);
+
+    const msg = formatSkipSummary(chatCount, totalFiles, skipped);
+    await updateJobProgress(
+      {
+        status: "done",
+        phase: "done",
+        skipped,
+        skipSummary: msg,
+        fileCount: totalFiles,
+        chatCount,
+        finishedAt: Date.now(),
+        message: msg,
+      },
+      tabId,
+    );
+
     notifyTab(tabId, {
       action: "artifactsProcessed",
       success: true,
       message: msg,
     });
-    return { message: msg, artifactCount };
+
+    showExportNotification(msg);
+
+    return {
+      message: msg,
+      artifactCount: totalFiles,
+      chatCount,
+      skipped,
+    };
   } catch (error) {
-    console.error(LOG_PREFIX, "ZIP download error:", error);
-    const msg = "Error downloading artifacts.";
+    console.error(LOG_PREFIX, "export job error:", error);
+    await updateJobProgress(
+      {
+        status: "error",
+        phase: "done",
+        finishedAt: Date.now(),
+        message: error.message,
+        errors: [error.message],
+      },
+      tabId,
+    );
     notifyTab(tabId, {
       action: "artifactsProcessed",
       failure: true,
-      message: msg,
+      message: error.message,
     });
     throw error;
   }
+}
+
+async function handleStartExportJob(request, sender) {
+  const existing = await getExportJob();
+  if (existing?.status === "running") {
+    throw new Error("An export is already in progress.");
+  }
+
+  const tabId = await findClaudeTab(getTabId(sender, request));
+  if (!tabId) {
+    throw new Error("Open claude.ai in a tab and try again.");
+  }
+
+  activeJobPromise = runExportJob(request, tabId).finally(() => {
+    activeJobPromise = null;
+  });
+
+  return { started: true };
+}
+
+async function handleDownloadArtifacts(request, sender) {
+  const tabId = await findClaudeTab(getTabId(sender, request));
+  if (!tabId && !request.uuid) {
+    const msg = "Open claude.ai in a tab and try again.";
+    throw new Error(msg);
+  }
+
+  const exportRequest = {
+    scope: "current",
+    uuid: request.uuid,
+    exportIncludes: resolveExportIncludes(request),
+    tabId,
+  };
+
+  if (!exportRequest.uuid) {
+    throw new Error("No conversation UUID found.");
+  }
+
+  console.log(LOG_PREFIX, "download requested for", exportRequest.uuid);
+  return runExportJob(exportRequest, tabId);
+}
+
+async function handleListConversations(_request, sender) {
+  const tabId = await findClaudeTab(getTabId(sender, _request));
+  if (!tabId) {
+    throw new Error("Open claude.ai in a tab and try again.");
+  }
+
+  const result = await fetchConversationListViaPageBridge(tabId, {
+    fetchAll: true,
+  });
+  if (result.error && !result.conversations.length) {
+    throw new Error(result.error);
+  }
+
+  return { conversations: result.conversations };
 }
 
 function getMessageText(message) {
@@ -317,172 +1118,11 @@ function getMessageText(message) {
   return "";
 }
 
-function inferLanguageFromFileType(fileType) {
-  if (!fileType) {
-    return "txt";
-  }
-  const ft = String(fileType).toLowerCase();
-  if (ft.includes("markdown") || ft === "md" || ft.endsWith(".md")) {
-    return "markdown";
-  }
-  if (ft.includes("json")) {
-    return "json";
-  }
-  if (ft.includes("html")) {
-    return "html";
-  }
-  if (ft.includes("python") || ft === "py") {
-    return "python";
-  }
-  if (ft.includes("javascript") || ft === "js") {
-    return "javascript";
-  }
-  return "txt";
-}
-
 function inferPastedTitle(text, sender) {
   const firstLine = text.trim().split("\n")[0].slice(0, 60);
   const cleaned = firstLine.replace(/[^\w\-._]+/g, "_").replace(/^_+|_+$/g, "");
   const prefix = sender === "human" ? "pasted" : "content";
   return cleaned ? `${prefix}_${cleaned}` : `${prefix}_message`;
-}
-
-function collectExportItems(message) {
-  const items = [];
-  const seen = new Set();
-  const text = getMessageText(message);
-
-  function addItem(item) {
-    const content = item.content?.trim();
-    if (!content) {
-      return;
-    }
-    const key = `${item.title}::${content.slice(0, 120)}`;
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    items.push({ ...item, content });
-  }
-
-  for (const artifact of extractArtifacts(text)) {
-    addItem(artifact);
-  }
-
-  if (Array.isArray(message.content)) {
-    for (const block of message.content) {
-      if (block.type === "thinking") {
-        continue;
-      }
-      if (block.type === "text" && block.text) {
-        for (const artifact of extractArtifacts(block.text)) {
-          addItem(artifact);
-        }
-      }
-      const blockBody =
-        block.text ||
-        block.content ||
-        block.source?.data ||
-        block.document?.content;
-      if (typeof blockBody === "string" && blockBody.length > 100) {
-        if (block.type && block.type !== "text") {
-          addItem({
-            title: block.title || block.name || block.type,
-            language: "txt",
-            content: blockBody,
-          });
-        }
-      }
-      if (block.type === "tool_result" && typeof block.content === "string") {
-        addItem({
-          title: "tool_result",
-          language: "txt",
-          content: block.content,
-        });
-      }
-    }
-  }
-
-  const attachmentSources = [
-    ...(message.attachments || []),
-    ...(message.files || []),
-    ...(message.files_v2 || []),
-  ];
-  for (const att of attachmentSources) {
-    const content = att.extracted_content || att.content;
-    if (typeof content === "string") {
-      addItem({
-        title: att.file_name || att.filename || att.name || "attachment",
-        language: inferLanguageFromFileType(att.file_type || att.mime_type),
-        content,
-      });
-    }
-  }
-
-  if (message.sender === "human" && text.trim().length > 80) {
-    addItem({
-      title: inferPastedTitle(text, "human"),
-      language: "markdown",
-      content: text.trim(),
-    });
-  }
-
-  return items;
-}
-
-function processMessage(
-  message,
-  payload,
-  zip,
-  usedNames,
-  artifactCount,
-  useDirectoryStructure,
-  depth = 0,
-) {
-  try {
-    const exportItems = collectExportItems(message);
-    exportItems.forEach((item) => {
-      artifactCount++;
-      const fileName = getUniqueFileName(
-        item.title,
-        item.language,
-        message.index,
-        usedNames,
-        useDirectoryStructure,
-      );
-      zip.file(fileName, item.content);
-      console.log(`Added export item: ${fileName}`);
-    });
-  } catch (error) {
-    console.error(`Error processing message ${message.uuid}:`, error);
-  }
-
-  if (depth > 100) {
-    console.warn(
-      "Maximum recursion depth reached. Stopping message processing.",
-    );
-    return artifactCount;
-  }
-
-  const childMessages = payload.chat_messages.filter(
-    (m) => m.parent_message_uuid === message.uuid,
-  );
-
-  childMessages
-    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-    .forEach((childMessage) => {
-      artifactCount = processMessage(
-        childMessage,
-        payload,
-        zip,
-        usedNames,
-        artifactCount,
-        useDirectoryStructure,
-        depth + 1,
-      );
-    });
-
-  return artifactCount;
 }
 
 function extractArtifacts(text) {
@@ -507,52 +1147,22 @@ function extractArtifacts(text) {
   return artifacts;
 }
 
-function getUniqueFileName(
-  title,
-  language,
-  messageIndex,
-  usedNames,
-  useDirectoryStructure,
-) {
-  let baseName = title.replace(/[^\w\-._]+/g, "_");
-  let extension = getFileExtension(language);
+function getUniqueFileName(title, language, messageIndex, usedNames) {
+  const baseName = title.replace(/[^\w\-._]+/g, "_");
+  const extension = getFileExtension(language);
 
-  let fileName = useDirectoryStructure
-    ? inferDirectoryStructure(baseName, extension)
-    : `${messageIndex + 1}_${baseName}${extension}`;
+  let fileName = `${messageIndex + 1}_${baseName}${extension}`;
   if (usedNames.has(fileName)) {
-    let suffix = "";
     let suffixCount = 1;
     while (usedNames.has(fileName)) {
-      suffix = `_${"*".repeat(suffixCount)}`;
-      fileName = useDirectoryStructure
-        ? inferDirectoryStructure(baseName, extension, messageIndex, suffix)
-        : `${messageIndex + 1}_${baseName}${suffix}${extension}`;
+      const suffix = `_${"*".repeat(suffixCount)}`;
+      fileName = `${messageIndex + 1}_${baseName}${suffix}${extension}`;
       suffixCount++;
     }
   }
 
   usedNames.add(fileName);
   return fileName;
-}
-
-function inferDirectoryStructure(
-  baseName,
-  extension,
-  messageIndex = null,
-  suffix = "",
-) {
-  const parts = baseName.split("/");
-  if (parts.length > 1) {
-    const fileName = `${parts.pop()}${suffix}${extension}`;
-    const directory = parts.join("/");
-    return messageIndex !== null
-      ? `${directory}/${messageIndex + 1}_${fileName}`
-      : `${directory}/${fileName}`;
-  }
-  return messageIndex !== null
-    ? `${messageIndex + 1}_${baseName}${suffix}${extension}`
-    : `${baseName}${suffix}${extension}`;
 }
 
 function getFileExtension(language) {
@@ -609,8 +1219,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     const rawUrl = buildRawConversationUrl(obj.url);
     storeChatFetchMeta(parsed.uuid, rawUrl);
 
-    const fetchUrl =
-      parsed.renderingMode === "raw" ? obj.url : rawUrl;
+    const fetchUrl = parsed.renderingMode === "raw" ? obj.url : rawUrl;
     if (parsed.renderingMode !== "raw") {
       console.log(
         LOG_PREFIX,
@@ -626,7 +1235,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       fetchUrl,
     );
 
-    fetchChat(fetchUrl, obj.method, obj.requestHeaders).then((resp) => {
+    fetchChat(fetchUrl, obj.method, obj.requestHeaders).then(async (resp) => {
       if (!resp) {
         console.warn(
           LOG_PREFIX,
@@ -635,17 +1244,21 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
         );
         return;
       }
-      if (resp.chat_messages && resp.uuid) {
-        console.log(
-          LOG_PREFIX,
-          "Stored chat payload:",
-          resp.uuid,
-          `(${resp.chat_messages.length} messages)`,
-        );
-        chrome.storage.local.set({ [`chat_${resp.uuid}`]: resp });
-      } else {
+      if (!isStorableChatPayload(resp)) {
         console.warn(LOG_PREFIX, "Unusable chat payload:", fetchUrl, resp);
+        return;
       }
+      const existing = await getStoragePayload(resp.uuid);
+      if (isValidChatPayload(existing) && resp.chat_messages.length === 0) {
+        return;
+      }
+      console.log(
+        LOG_PREFIX,
+        "Stored chat payload:",
+        resp.uuid,
+        `(${resp.chat_messages.length} messages)`,
+      );
+      await storeChatPayload(resp);
     });
   },
   {
@@ -665,7 +1278,9 @@ function isOwnRequest(obj) {
 }
 
 async function fetchChat(url, method, requestHeaders, uuid) {
-  const headers = uuid ? getActiveFetchHeaders(uuid) : { Accept: "application/json" };
+  const headers = uuid
+    ? getActiveFetchHeaders(uuid)
+    : { Accept: "application/json" };
   (requestHeaders ?? []).forEach(
     (header) => (headers[header.name] = header.value),
   );
@@ -691,7 +1306,7 @@ async function fetchPayloadFromUrl(url, requestHeaders, uuid) {
   if (!resp) {
     return { payload: null, error: `HTTP or network error for ${url}` };
   }
-  if (!isValidChatPayload(resp)) {
+  if (!isStorableChatPayload(resp)) {
     return { payload: null, error: `unusable payload from ${url}` };
   }
   return { payload: resp };
@@ -755,150 +1370,324 @@ async function fetchPayloadViaOrgDiscovery(uuid) {
   };
 }
 
-async function fetchPayloadViaPageEventBridge(tabId, uuid, options = {}) {
-  const rawOnly = options.rawOnly === true;
+function normalizeConversationSummary(conv) {
+  return {
+    uuid: conv.uuid,
+    name: conv.name || "Untitled",
+    updated_at: conv.updated_at || conv.created_at || null,
+    created_at: conv.created_at || null,
+  };
+}
+
+async function runPageBridge(tabId, bridgeMessage, injectFunc, args) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!CLAUDE_URL_PATTERN.test(tab.url || "")) {
+    throw new Error(`tab is not a Claude page: ${tab.url || "unknown"}`);
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error("page fetch timed out after 60s"));
+    }, 60000);
+
+    chrome.tabs.sendMessage(
+      tabId,
+      bridgeMessage,
+      (response) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(response);
+      },
+    );
+
+    chrome.scripting
+      .executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: injectFunc,
+        args,
+      })
+      .catch((error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+  });
+}
+
+async function fetchConversationListViaPageBridge(tabId, options = {}) {
+  const fetchAll = options.fetchAll === true;
+  const requestId = `list-${Date.now()}`;
+  const eventName = `cad-conversation-list-${requestId}`;
+
   try {
-    const tab = await chrome.tabs.get(tabId);
-    if (!CHAT_URL_PATTERN.test(tab.url || "")) {
-      return {
-        payload: null,
-        error: `tab is not a Claude chat page: ${tab.url || "unknown"}`,
-      };
-    }
+    const result = await runPageBridge(
+      tabId,
+      { action: "listenForConversationList", eventName },
+      (bridgeEventName, fetchAllFlag, pageSize) => {
+        return (async () => {
+          function dispatch(detail) {
+            document.dispatchEvent(
+              new CustomEvent(bridgeEventName, { detail }),
+            );
+          }
 
-    const result = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error("page fetch timed out after 30s"));
-      }, 30000);
+          function chatOrgs(data) {
+            const orgs = Array.isArray(data)
+              ? data
+              : data.organizations || data.data || [];
+            return orgs
+              .filter((org) => {
+                const caps = org.capabilities;
+                return !caps || caps.includes("chat");
+              })
+              .map((org) => org.uuid || org.id)
+              .filter(Boolean);
+          }
 
-      chrome.tabs.sendMessage(
-        tabId,
-        { action: "listenForPayload", uuid },
-        (response) => {
-          clearTimeout(timeout);
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
+          async function discoverOrgIds() {
+            const ids = [];
+            try {
+              const response = await fetch("/api/organizations", {
+                credentials: "include",
+                headers: { Accept: "application/json" },
+              });
+              if (response.ok) {
+                ids.push(...chatOrgs(await response.json()));
+              }
+            } catch {
+              // ignore
+            }
+            return [...new Set(ids)];
+          }
+
+          const orgIds = await discoverOrgIds();
+          if (!orgIds.length) {
+            dispatch({
+              conversations: [],
+              error: "no chat-capable organizations found",
+            });
             return;
           }
-          resolve(response);
-        },
-      );
 
-      chrome.scripting
-        .executeScript({
-          target: { tabId },
-          world: "MAIN",
-          func: (convUuid, onlyRaw) => {
-            return (async () => {
-              const eventName = `cad-payload-${convUuid}`;
+          const allConversations = [];
+          const seen = new Set();
+          const errors = [];
 
-              function dispatch(detail) {
-                document.dispatchEvent(
-                  new CustomEvent(eventName, { detail }),
-                );
+          for (const orgId of orgIds) {
+            let offset = 0;
+            let total = null;
+
+            try {
+              const countResp = await fetch(
+                `/api/organizations/${orgId}/chat_conversations/count_all`,
+                {
+                  credentials: "include",
+                  headers: { Accept: "application/json" },
+                },
+              );
+              if (countResp.ok) {
+                const countData = await countResp.json();
+                total = countData.count ?? countData.total ?? null;
               }
+            } catch {
+              // ignore
+            }
 
-              function chatOrgs(data) {
-                const orgs = Array.isArray(data)
-                  ? data
-                  : data.organizations || data.data || [];
-                return orgs
-                  .filter((org) => {
-                    const caps = org.capabilities;
-                    return !caps || caps.includes("chat");
-                  })
-                  .map((org) => org.uuid || org.id)
-                  .filter(Boolean);
-              }
-
-              async function discoverOrgIds() {
-                const ids = [];
-                try {
-                  const response = await fetch("/api/organizations", {
-                    credentials: "include",
-                    headers: { Accept: "application/json" },
-                  });
-                  if (response.ok) {
-                    ids.push(...chatOrgs(await response.json()));
-                  }
-                } catch {
-                  // ignore
-                }
-                return [...new Set(ids)];
-              }
-
-              const paramSets = onlyRaw
-                ? [{ tree: "True", rendering_mode: "raw" }]
-                : [
-                    {
-                      tree: "True",
-                      rendering_mode: "messages",
-                      render_all_tools: "true",
-                    },
-                    { tree: "True", rendering_mode: "raw" },
-                  ];
-              const orgIds = await discoverOrgIds();
-              const errors = [];
-              if (!orgIds.length) {
-                dispatch({
-                  payload: null,
-                  error: "no chat-capable organizations found in page context",
-                  orgCount: 0,
+            while (true) {
+              try {
+                const path = `/api/organizations/${orgId}/chat_conversations?limit=${pageSize}&offset=${offset}&starred=false`;
+                const response = await fetch(path, {
+                  credentials: "include",
+                  headers: { Accept: "application/json" },
                 });
-                return;
-              }
-
-              for (const orgId of orgIds) {
-                for (const ps of paramSets) {
-                  const query = new URLSearchParams(ps).toString();
-                  const path = `/api/organizations/${orgId}/chat_conversations/${convUuid}?${query}`;
-                  const absoluteUrl = `https://claude.ai${path}`;
-                  try {
-                    const response = await fetch(path, {
-                      credentials: "include",
-                      headers: {
-                        Accept: "application/json",
-                        Referer: `https://claude.ai/chat/${convUuid}`,
-                        "anthropic-client-platform": "web_claude_ai",
-                      },
+                if (!response.ok) {
+                  errors.push(`HTTP ${response.status} for ${path}`);
+                  break;
+                }
+                const data = await response.json();
+                const batch = Array.isArray(data)
+                  ? data
+                  : data.conversations || data.data || [];
+                for (const conv of batch) {
+                  if (conv?.uuid && !seen.has(conv.uuid)) {
+                    seen.add(conv.uuid);
+                    allConversations.push({
+                      uuid: conv.uuid,
+                      name: conv.name || "Untitled",
+                      updated_at: conv.updated_at || conv.created_at,
+                      created_at: conv.created_at,
                     });
-                    if (!response.ok) {
-                      errors.push(`HTTP ${response.status} for ${path}`);
-                      continue;
-                    }
-                    const json = await response.json();
-                    if (json?.uuid && json?.chat_messages?.length) {
-                      dispatch({
-                        payload: json,
-                        rawUrl: absoluteUrl,
-                        orgCount: orgIds.length,
-                        messageCount: json.chat_messages.length,
-                      });
-                      return;
-                    }
-                    errors.push(`unusable payload from ${path}`);
-                  } catch (error) {
-                    errors.push(`${error.message} (${path})`);
                   }
                 }
+                if (!fetchAllFlag) {
+                  break;
+                }
+                offset += batch.length;
+                if (batch.length < pageSize) {
+                  break;
+                }
+                if (total !== null && offset >= total) {
+                  break;
+                }
+              } catch (error) {
+                errors.push(error.message);
+                break;
               }
+            }
+          }
 
-              dispatch({
-                payload: null,
-                error: errors.join("; ") || "all page fetches failed",
-                orgCount: orgIds.length,
+          allConversations.sort(
+            (a, b) =>
+              new Date(b.updated_at || 0) - new Date(a.updated_at || 0),
+          );
+
+          dispatch({
+            conversations: allConversations,
+            error: errors.length ? errors.join("; ") : null,
+          });
+        })();
+      },
+      [eventName, fetchAll, LIST_PAGE_SIZE],
+    );
+
+    const conversations = (result?.conversations || []).map(
+      normalizeConversationSummary,
+    );
+    return {
+      conversations,
+      error: result?.error || null,
+    };
+  } catch (error) {
+    return { conversations: [], error: error.message };
+  }
+}
+
+async function fetchAllConversations(tabId) {
+  const result = await fetchConversationListViaPageBridge(tabId, {
+    fetchAll: true,
+  });
+  if (result.error && !result.conversations.length) {
+    throw new Error(result.error);
+  }
+  return result.conversations;
+}
+
+async function fetchPayloadViaPageEventBridge(tabId, uuid, options = {}) {
+  const rawOnly = options.rawOnly === true;
+
+  try {
+    const result = await runPageBridge(
+      tabId,
+      { action: "listenForPayload", uuid },
+      (convUuid, onlyRaw) => {
+        return (async () => {
+          const eventName = `cad-payload-${convUuid}`;
+
+          function dispatch(detail) {
+            document.dispatchEvent(
+              new CustomEvent(eventName, { detail }),
+            );
+          }
+
+          function chatOrgs(data) {
+            const orgs = Array.isArray(data)
+              ? data
+              : data.organizations || data.data || [];
+            return orgs
+              .filter((org) => {
+                const caps = org.capabilities;
+                return !caps || caps.includes("chat");
+              })
+              .map((org) => org.uuid || org.id)
+              .filter(Boolean);
+          }
+
+          async function discoverOrgIds() {
+            const ids = [];
+            try {
+              const response = await fetch("/api/organizations", {
+                credentials: "include",
+                headers: { Accept: "application/json" },
               });
-            })();
-          },
-          args: [uuid, rawOnly],
-        })
-        .catch((error) => {
-          clearTimeout(timeout);
-          reject(error);
-        });
-    });
+              if (response.ok) {
+                ids.push(...chatOrgs(await response.json()));
+              }
+            } catch {
+              // ignore
+            }
+            return [...new Set(ids)];
+          }
 
-    if (isValidChatPayload(result?.payload)) {
+          const paramSets = onlyRaw
+            ? [{ tree: "True", rendering_mode: "raw" }]
+            : [
+                {
+                  tree: "True",
+                  rendering_mode: "messages",
+                  render_all_tools: "true",
+                },
+                { tree: "True", rendering_mode: "raw" },
+              ];
+          const orgIds = await discoverOrgIds();
+          const errors = [];
+          if (!orgIds.length) {
+            dispatch({
+              payload: null,
+              error: "no chat-capable organizations found in page context",
+              orgCount: 0,
+            });
+            return;
+          }
+
+          for (const orgId of orgIds) {
+            for (const ps of paramSets) {
+              const query = new URLSearchParams(ps).toString();
+              const path = `/api/organizations/${orgId}/chat_conversations/${convUuid}?${query}`;
+              const absoluteUrl = `https://claude.ai${path}`;
+              try {
+                const response = await fetch(path, {
+                  credentials: "include",
+                  headers: {
+                    Accept: "application/json",
+                    Referer: `https://claude.ai/chat/${convUuid}`,
+                    "anthropic-client-platform": "web_claude_ai",
+                  },
+                });
+                if (!response.ok) {
+                  errors.push(`HTTP ${response.status} for ${path}`);
+                  continue;
+                }
+                const json = await response.json();
+                if (json?.uuid && Array.isArray(json?.chat_messages)) {
+                  dispatch({
+                    payload: json,
+                    rawUrl: absoluteUrl,
+                    orgCount: orgIds.length,
+                    messageCount: json.chat_messages.length,
+                  });
+                  return;
+                }
+                errors.push(`unusable payload from ${path}`);
+              } catch (error) {
+                errors.push(`${error.message} (${path})`);
+              }
+            }
+          }
+
+          dispatch({
+            payload: null,
+            error: errors.join("; ") || "all page fetches failed",
+            orgCount: orgIds.length,
+          });
+        })();
+      },
+      [uuid, rawOnly],
+    );
+
+    if (isStorableChatPayload(result?.payload)) {
       if (result.rawUrl) {
         storeChatFetchMeta(uuid, result.rawUrl);
       }
@@ -916,15 +1705,18 @@ async function fetchPayloadViaPageEventBridge(tabId, uuid, options = {}) {
 
 async function ensureChatPayload(uuid, tabId) {
   const cached = await getStoragePayload(uuid);
-  if (isValidChatPayload(cached)) {
+  if (isStorableChatPayload(cached)) {
     console.log(LOG_PREFIX, "cache hit for", uuid);
     return { payload: cached };
   }
 
   console.log(LOG_PREFIX, "cache miss for", uuid, "; attempting active fetch");
   const errors = [];
+  let pageFetchAttempted = false;
+  let pageFetchError = null;
 
   if (tabId) {
+    pageFetchAttempted = true;
     console.log(LOG_PREFIX, "trying page-context fetch ...");
     const pageResult = await fetchPayloadViaPageEventBridge(tabId, uuid);
     if (pageResult.payload) {
@@ -937,13 +1729,14 @@ async function ensureChatPayload(uuid, tabId) {
       );
       return { payload: pageResult.payload };
     }
-    errors.push(pageResult.error || "page-context fetch failed");
+    pageFetchError = pageResult.error || "page-context fetch failed";
+    errors.push(pageFetchError);
   } else {
     errors.push("no tab id for page-context fetch");
   }
 
   const meta = await getChatFetchMeta(uuid);
-  if (meta?.rawUrl) {
+  if (meta?.rawUrl && !meta.rawUrl.includes("/task/")) {
     console.log(LOG_PREFIX, "trying stored raw URL ...", meta.rawUrl);
     const storedResult = await fetchPayloadFromUrl(meta.rawUrl, null, uuid);
     if (storedResult.payload) {
@@ -959,21 +1752,29 @@ async function ensureChatPayload(uuid, tabId) {
     errors.push(storedResult.error || "stored raw URL failed");
   }
 
-  console.log(LOG_PREFIX, "trying organization discovery ...");
-  const orgResult = await fetchPayloadViaOrgDiscovery(uuid);
-  if (orgResult.payload) {
-    await storeChatPayload(orgResult.payload);
-    console.log(
-      LOG_PREFIX,
-      "active fetch succeeded:",
-      uuid,
-      `(${orgResult.payload.chat_messages.length} messages)`,
-    );
-    return { payload: orgResult.payload };
-  }
-  errors.push(orgResult.error || "organization discovery failed");
+  const skipOrgDiscovery =
+    pageFetchAttempted &&
+    pageFetchError &&
+    !pageFetchError.includes("no chat-capable organizations");
 
-  const reason = errors.filter(Boolean).join("; ");
-  console.log(LOG_PREFIX, "active fetch failed:", reason);
-  return { payload: null, error: reason || "unknown" };
+  if (!skipOrgDiscovery) {
+    console.log(LOG_PREFIX, "trying organization discovery ...");
+    const orgResult = await fetchPayloadViaOrgDiscovery(uuid);
+    if (orgResult.payload) {
+      await storeChatPayload(orgResult.payload);
+      console.log(
+        LOG_PREFIX,
+        "active fetch succeeded:",
+        uuid,
+        `(${orgResult.payload.chat_messages.length} messages)`,
+      );
+      return { payload: orgResult.payload };
+    }
+    errors.push(orgResult.error || "organization discovery failed");
+  }
+
+  const detail = errors.filter(Boolean).join("; ");
+  const summary = summarizeFetchError(errors);
+  console.warn(LOG_PREFIX, "active fetch failed for", uuid, detail);
+  return { payload: null, error: summary || "unknown" };
 }

@@ -13,7 +13,10 @@ function createBanner(message, type = "error", timeout = 8000) {
         z-index: 9999;
         animation: slideDown 0.5s ease-out;
     `;
-  banner.innerHTML = `<p>${message}</p>`;
+  const paragraph = document.createElement("p");
+  paragraph.style.whiteSpace = "pre-wrap";
+  paragraph.textContent = message;
+  banner.appendChild(paragraph);
   document.body.prepend(banner);
 
   // Set a timeout to remove the banner after 8 seconds
