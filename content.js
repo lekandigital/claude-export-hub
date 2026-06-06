@@ -3,6 +3,108 @@ const CHAT_UUID_PATTERN = /\/chat\/([0-9a-f-]{36})/i;
 const CHAT_PAGE_PATTERN = /^https:\/\/claude\.ai\/chat\/[^/]+/i;
 const PREFS_KEY = "exportPreferences";
 
+function cleanText(text) {
+  return String(text || "")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function looksLikeThinkingTitle(title) {
+  if (!title) {
+    return false;
+  }
+
+  const lower = title.toLowerCase();
+
+  if (lower.includes("thinking")) {
+    return true;
+  }
+  if (lower.includes("synthesizing")) {
+    return true;
+  }
+  if (lower.includes("analyzing")) {
+    return true;
+  }
+  if (lower.includes("reviewing")) {
+    return true;
+  }
+  if (lower.includes("checking")) {
+    return true;
+  }
+  if (lower.includes("curating")) {
+    return true;
+  }
+  if (lower.includes("planning")) {
+    return true;
+  }
+  if (lower.includes("extracting")) {
+    return true;
+  }
+
+  return false;
+}
+
+function dedupeTitleFromBody(title, body) {
+  let output = body.trim();
+
+  while (output.startsWith(title)) {
+    output = output.slice(title.length).trim();
+  }
+
+  return output;
+}
+
+function collectVisibleThinkingFromDom() {
+  const turns = [...document.querySelectorAll("[data-is-streaming]")];
+  const results = [];
+
+  for (const [turnIndex, turn] of turns.entries()) {
+    const statusButtons = [...turn.querySelectorAll("button[aria-expanded]")];
+
+    for (const [blockIndex, button] of statusButtons.entries()) {
+      const title = cleanText(button.innerText);
+
+      if (!looksLikeThinkingTitle(title)) {
+        continue;
+      }
+
+      const blockRoot =
+        button.closest(".grid") ||
+        button.closest("[class*='grid-rows']") ||
+        button.parentElement?.parentElement?.parentElement;
+
+      const bodyCandidates = [
+        blockRoot?.querySelector("[class*='row-start-2']"),
+        blockRoot?.querySelector("[class*='font-ui']"),
+        blockRoot,
+      ].filter(Boolean);
+
+      const body = cleanText(
+        bodyCandidates
+          .map((el) => el.innerText || "")
+          .sort((a, b) => b.length - a.length)[0] || "",
+      );
+
+      const content = dedupeTitleFromBody(title, body);
+
+      if (content && content.length > 40) {
+        results.push({
+          source: "dom",
+          turnIndex,
+          blockIndex,
+          title,
+          content,
+          streaming: turn.getAttribute("data-is-streaming") === "true",
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
 function extractChatUuid(url) {
   const match = url.match(CHAT_UUID_PATTERN);
   return match ? match[1] : null;
@@ -65,7 +167,8 @@ function createButton(text) {
   button.className =
     "claude-download-button flex items-center rounded-md bg-gray-100 py-1 px-3 text-sm font-medium text-gray-800 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md";
   button.type = "button";
-  button.title = "Saves chat.md, artifacts/, and pasted/ per your checkboxes";
+  button.title =
+    "Saves chat.md, artifacts/, pasted/, and thinking/ per your checkboxes";
   button.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>${text}`;
   button.addEventListener("click", downloadArtifacts);
   return button;
@@ -81,6 +184,7 @@ function createIncludesPanel() {
     { id: "transcript", label: "Transcript", defaultOn: true },
     { id: "artifacts", label: "Artifacts", defaultOn: true },
     { id: "pasted", label: "Pasted", defaultOn: true },
+    { id: "thinking", label: "Visible thinking", defaultOn: false },
   ];
 
   for (const opt of options) {
@@ -105,6 +209,8 @@ function getExportIncludesFromPage() {
     artifacts:
       document.querySelector(".claude-include-artifacts")?.checked ?? true,
     pasted: document.querySelector(".claude-include-pasted")?.checked ?? true,
+    thinking:
+      document.querySelector(".claude-include-thinking")?.checked ?? false,
   };
 }
 
@@ -118,10 +224,16 @@ function loadIncludePrefs() {
       transcript: ".claude-include-transcript",
       artifacts: ".claude-include-artifacts",
       pasted: ".claude-include-pasted",
+      thinking: ".claude-include-thinking",
     };
     for (const [key, selector] of Object.entries(map)) {
       const el = document.querySelector(selector);
-      if (el && includes[key] !== undefined) {
+      if (!el || includes[key] === undefined) {
+        continue;
+      }
+      if (key === "thinking") {
+        el.checked = includes.thinking === true;
+      } else {
         el.checked = includes[key] !== false;
       }
     }
@@ -139,6 +251,9 @@ function getIncludeSummary() {
   }
   if (includes.pasted) {
     parts.push("pasted");
+  }
+  if (includes.thinking) {
+    parts.push("visible thinking");
   }
   return parts.join(", ") || "nothing";
 }
@@ -179,7 +294,8 @@ function downloadArtifacts() {
   if (
     !exportIncludes.transcript &&
     !exportIncludes.artifacts &&
-    !exportIncludes.pasted
+    !exportIncludes.pasted &&
+    !exportIncludes.thinking
   ) {
     createBanner("Select at least one content type to export.", "error", 3000);
     return;
@@ -212,6 +328,46 @@ function downloadArtifacts() {
 }
 
 let domObserver = null;
+let thinkingObserver = null;
+let thinkingDebounceTimer = null;
+
+function flushThinkingCache() {
+  const uuid = extractChatUuid(window.location.href);
+  if (!uuid) {
+    return;
+  }
+
+  const blocks = collectVisibleThinkingFromDom();
+  chrome.runtime.sendMessage({
+    action: "cacheVisibleThinking",
+    uuid,
+    blocks,
+    updatedAt: Date.now(),
+  });
+}
+
+function scheduleThinkingCacheUpdate() {
+  clearTimeout(thinkingDebounceTimer);
+  thinkingDebounceTimer = setTimeout(flushThinkingCache, 400);
+}
+
+function startThinkingObserver() {
+  if (thinkingObserver || !isChatPage(window.location.href)) {
+    return;
+  }
+
+  thinkingObserver = new MutationObserver(() => {
+    scheduleThinkingCacheUpdate();
+  });
+
+  thinkingObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+
+  setTimeout(flushThinkingCache, 500);
+}
 
 function startDomObserver() {
   if (domObserver) {
@@ -244,6 +400,8 @@ function checkAndAddShareButtons() {
     console.log(LOG_PREFIX, "not a chat page, skipping button injection");
     return;
   }
+
+  startThinkingObserver();
 
   const uuid = extractChatUuid(window.location.href);
   if (uuid) {
@@ -319,6 +477,16 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       { once: true },
     );
     return true;
+  }
+
+  if (request.action === "getVisibleThinking") {
+    const currentUuid = extractChatUuid(window.location.href);
+    if (currentUuid !== request.uuid) {
+      sendResponse({ blocks: [] });
+      return false;
+    }
+    sendResponse({ blocks: collectVisibleThinkingFromDom() });
+    return false;
   }
 
   if (request.action === "artifactsProcessed") {
