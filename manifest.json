@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "Claude Artifact Downloader",
-  "version": "1.0",
-  "description": "Download artifacts from Claude chat conversations as a ZIP file",
+  "name": "Claude Export Hub",
+  "version": "2.0",
+  "description": "Export Claude chats, transcripts, artifacts, and pasted content as organized ZIP archives",
   "permissions": [
     "tabs",
     "downloads",
     "storage",
     "webRequest",
-    "scripting"
+    "scripting",
+    "notifications"
   ],
   "host_permissions": [
     "https://claude.ai/*",
@@ -31,6 +32,13 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Export Claude artifacts"
+    "default_title": "Claude Export Hub",
+    "default_icon": {
+      "48": "icon48.png"
+    }
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
   }
 }

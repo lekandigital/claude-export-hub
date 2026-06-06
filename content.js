@@ -1,6 +1,7 @@
-const LOG_PREFIX = "[Claude Artifact Downloader]";
+const LOG_PREFIX = "[Claude Export Hub]";
 const CHAT_UUID_PATTERN = /\/chat\/([0-9a-f-]{36})/i;
 const CHAT_PAGE_PATTERN = /^https:\/\/claude\.ai\/chat\/[^/]+/i;
+const PREFS_KEY = "exportPreferences";
 
 function extractChatUuid(url) {
   const match = url.match(CHAT_UUID_PATTERN);
@@ -17,10 +18,12 @@ function createDownloadContainer() {
     "claude-download-container flex items-center gap-2 shrink-0";
   downloadContainer.setAttribute("data-claude-downloader", "true");
 
-  const downloadButton = createButton("Download artifacts");
-  const optionsDropdown = createOptionsDropdown();
+  const menuButton = createMenuButton();
+  const includesPanel = createIncludesPanel();
+  const downloadButton = createButton("Export this chat");
 
-  downloadContainer.appendChild(optionsDropdown);
+  downloadContainer.appendChild(menuButton);
+  downloadContainer.appendChild(includesPanel);
   downloadContainer.appendChild(downloadButton);
   return downloadContainer;
 }
@@ -32,9 +35,10 @@ function injectFloatingButton() {
 
   const downloadContainer = createDownloadContainer();
   downloadContainer.style.cssText =
-    "position: fixed; bottom: 88px; right: 16px; z-index: 40; display: flex; align-items: center; gap: 8px; pointer-events: auto;";
+    "position: fixed; bottom: 88px; right: 16px; z-index: 40; display: flex; align-items: center; gap: 6px; pointer-events: auto;";
 
   document.body.appendChild(downloadContainer);
+  loadIncludePrefs();
   console.log(
     LOG_PREFIX,
     "button injected successfully (floating, bottom-right)",
@@ -61,28 +65,107 @@ function createButton(text) {
   button.className =
     "claude-download-button flex items-center rounded-md bg-gray-100 py-1 px-3 text-sm font-medium text-gray-800 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md";
   button.type = "button";
+  button.title = "Saves chat.md, artifacts/, and pasted/ per your checkboxes";
   button.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>${text}`;
   button.addEventListener("click", downloadArtifacts);
   return button;
 }
 
-function createOptionsDropdown() {
-  const select = document.createElement("select");
-  select.className =
-    "claude-download-options rounded-md bg-gray-100 py-1 px-2 text-sm font-medium text-gray-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md";
+function createIncludesPanel() {
+  const panel = document.createElement("div");
+  panel.className = "claude-download-includes";
+  panel.style.cssText =
+    "display:flex;align-items:center;gap:6px;background:#f3f4f6;border-radius:6px;padding:2px 6px;box-shadow:0 1px 2px rgba(0,0,0,0.08);font-size:11px;color:#374151;";
 
-  const flatOption = document.createElement("option");
-  flatOption.value = "flat";
-  flatOption.textContent = "Flat structure";
+  const options = [
+    { id: "transcript", label: "Transcript", defaultOn: true },
+    { id: "artifacts", label: "Artifacts", defaultOn: true },
+    { id: "pasted", label: "Pasted", defaultOn: true },
+  ];
 
-  const structuredOption = document.createElement("option");
-  structuredOption.value = "structured";
-  structuredOption.textContent = "Inferred structure";
+  for (const opt of options) {
+    const label = document.createElement("label");
+    label.style.cssText = "display:flex;align-items:center;gap:3px;cursor:pointer;";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.className = `claude-include-${opt.id}`;
+    checkbox.checked = opt.defaultOn;
+    label.appendChild(checkbox);
+    label.appendChild(document.createTextNode(opt.label));
+    panel.appendChild(label);
+  }
 
-  select.appendChild(flatOption);
-  select.appendChild(structuredOption);
+  return panel;
+}
 
-  return select;
+function getExportIncludesFromPage() {
+  return {
+    transcript:
+      document.querySelector(".claude-include-transcript")?.checked ?? true,
+    artifacts:
+      document.querySelector(".claude-include-artifacts")?.checked ?? true,
+    pasted: document.querySelector(".claude-include-pasted")?.checked ?? true,
+  };
+}
+
+function loadIncludePrefs() {
+  chrome.storage.local.get([PREFS_KEY], (result) => {
+    const includes = result[PREFS_KEY]?.includes;
+    if (!includes) {
+      return;
+    }
+    const map = {
+      transcript: ".claude-include-transcript",
+      artifacts: ".claude-include-artifacts",
+      pasted: ".claude-include-pasted",
+    };
+    for (const [key, selector] of Object.entries(map)) {
+      const el = document.querySelector(selector);
+      if (el && includes[key] !== undefined) {
+        el.checked = includes[key] !== false;
+      }
+    }
+  });
+}
+
+function getIncludeSummary() {
+  const includes = getExportIncludesFromPage();
+  const parts = [];
+  if (includes.transcript) {
+    parts.push("transcript");
+  }
+  if (includes.artifacts) {
+    parts.push("artifacts");
+  }
+  if (includes.pasted) {
+    parts.push("pasted");
+  }
+  return parts.join(", ") || "nothing";
+}
+
+function createMenuButton() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className =
+    "claude-download-menu rounded-md bg-gray-100 py-1 px-2 text-sm font-medium text-gray-800 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md";
+  button.title = "More export options (pick chats, export all)";
+  button.textContent = "⋯";
+  button.addEventListener("click", async () => {
+    try {
+      if (chrome.action?.openPopup) {
+        await chrome.action.openPopup();
+        return;
+      }
+    } catch {
+      // openPopup requires a user gesture and may be unavailable
+    }
+    createBanner(
+      "Click the extension icon for bulk export (pick chats or export all).",
+      "success",
+      4000,
+    );
+  });
+  return button;
 }
 
 function downloadArtifacts() {
@@ -92,15 +175,24 @@ function downloadArtifacts() {
     return;
   }
 
+  const exportIncludes = getExportIncludesFromPage();
+  if (
+    !exportIncludes.transcript &&
+    !exportIncludes.artifacts &&
+    !exportIncludes.pasted
+  ) {
+    createBanner("Select at least one content type to export.", "error", 3000);
+    return;
+  }
+
   console.log(LOG_PREFIX, "export requested for", uuid);
-  const optionsDropdown = document.querySelector(".claude-download-options");
-  const useDirectoryStructure = optionsDropdown?.value === "structured";
+  createBanner(`Exporting ${getIncludeSummary()}…`, "success", 2000);
 
   chrome.runtime.sendMessage(
     {
       action: "downloadArtifacts",
       uuid: uuid,
-      useDirectoryStructure: useDirectoryStructure,
+      exportIncludes,
     },
     (response) => {
       if (chrome.runtime.lastError) {
@@ -113,6 +205,7 @@ function downloadArtifacts() {
         console.log(LOG_PREFIX, "export success:", response.message);
       } else if (response?.error) {
         console.log(LOG_PREFIX, "export failure:", response.error);
+        createBanner(response.error, "error", 3000);
       }
     },
   );
@@ -211,16 +304,54 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     return true;
   }
 
+  if (request.action === "listenForConversationList") {
+    const eventName = request.eventName;
+    console.log(LOG_PREFIX, "listening for conversation list event:", eventName);
+    document.addEventListener(
+      eventName,
+      (event) => {
+        const detail = event.detail ?? {
+          conversations: [],
+          error: "empty conversation list event",
+        };
+        sendResponse(detail);
+      },
+      { once: true },
+    );
+    return true;
+  }
+
   if (request.action === "artifactsProcessed") {
     if (request.success) {
       console.log(LOG_PREFIX, "export success:", request.message);
-      createBanner(request.message, "success", 1000);
+      const summary = request.message?.split("\n")[0] || request.message;
+      createBanner(summary, "success", 3000);
     } else if (request.failure) {
       console.log(LOG_PREFIX, "export failure:", request.message);
       createBanner(request.message, "error", 3000);
     } else if (request.message) {
       console.log(LOG_PREFIX, "export failure:", request.message);
       createBanner(request.message, "error", 3000);
+    }
+  } else if (request.action === "exportProgress") {
+    const job = request.job;
+    if (!job) {
+      return;
+    }
+    if (job.status === "running" || job.status === "cancelling") {
+      const total = job.total || 1;
+      const current = job.current || 0;
+      const progressKey = `${current}/${total}`;
+      if (
+        window.__cadLastProgressKey === progressKey &&
+        current % 5 !== 0 &&
+        current !== total
+      ) {
+        return;
+      }
+      window.__cadLastProgressKey = progressKey;
+      const name = job.currentChatName ? ` — ${job.currentChatName}` : "";
+      createBanner(`Exporting ${current}/${total}${name}`, "success", 1500);
     }
   } else if (request.action === "checkAndAddDownloadButton") {
     checkAndAddShareButtons();

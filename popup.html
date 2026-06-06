@@ -3,37 +3,383 @@
   <head>
     <meta charset="utf-8" />
     <style>
+      * {
+        box-sizing: border-box;
+      }
       body {
-        font-family: system-ui, sans-serif;
-        margin: 12px;
-        min-width: 220px;
+        font-family: system-ui, -apple-system, sans-serif;
+        margin: 0;
+        width: 380px;
+        max-height: 520px;
+        display: flex;
+        flex-direction: column;
+        color: #111827;
+        background: #fff;
       }
-      select {
-        width: 100%;
-        margin-bottom: 8px;
-        padding: 6px;
-        font-size: 13px;
+      header {
+        padding: 12px 12px 0;
       }
-      button {
-        width: 100%;
-        padding: 8px;
-        font-size: 13px;
+      h1 {
+        font-size: 14px;
+        font-weight: 600;
+        margin: 0 0 10px;
+      }
+      .tabs {
+        display: flex;
+        gap: 4px;
+        border-bottom: 1px solid #e5e7eb;
+        padding-bottom: 0;
+      }
+      .tab {
+        flex: 1;
+        padding: 8px 6px;
+        font-size: 12px;
+        border: none;
+        background: none;
         cursor: pointer;
-        background: #f3f4f6;
+        color: #6b7280;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -1px;
+      }
+      .tab:hover {
+        color: #374151;
+      }
+      .tab.active {
+        color: #4f46e5;
+        border-bottom-color: #4f46e5;
+        font-weight: 500;
+      }
+      .options {
+        padding: 10px 12px;
+        border-bottom: 1px solid #f3f4f6;
+      }
+      .options-label {
+        font-size: 11px;
+        color: #6b7280;
+        margin: 0 0 8px;
+        font-weight: 500;
+      }
+      .checkbox-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 14px;
+      }
+      .checkbox-item {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 12px;
+        color: #374151;
+        cursor: pointer;
+      }
+      .checkbox-item input {
+        margin: 0;
+        cursor: pointer;
+      }
+      .include-hint {
+        font-size: 11px;
+        color: #6b7280;
+        margin: 8px 0 0;
+        line-height: 1.35;
+      }
+      .include-hint.error {
+        color: #dc2626;
+      }
+      input[type="search"] {
+        width: 100%;
+        padding: 6px 8px;
+        font-size: 12px;
         border: 1px solid #d1d5db;
         border-radius: 6px;
+        background: #fff;
       }
-      button:hover {
+      input:focus,
+      button:focus {
+        outline: 2px solid #a5b4fc;
+        outline-offset: 1px;
+      }
+      .panel {
+        display: none;
+        flex: 1;
+        overflow: hidden;
+        flex-direction: column;
+        min-height: 0;
+      }
+      .panel.active {
+        display: flex;
+      }
+      .panel-body {
+        padding: 12px;
+        flex: 1;
+        overflow-y: auto;
+      }
+      .panel-body p {
+        font-size: 12px;
+        color: #6b7280;
+        margin: 0 0 8px;
+        line-height: 1.4;
+      }
+      .chat-toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 8px;
+        gap: 8px;
+      }
+      .chat-toolbar input {
+        flex: 1;
+      }
+      .link-btn {
+        font-size: 11px;
+        color: #4f46e5;
+        background: none;
+        border: none;
+        cursor: pointer;
+        padding: 0;
+        white-space: nowrap;
+      }
+      .link-btn:hover {
+        text-decoration: underline;
+      }
+      .chat-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      .chat-item {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        padding: 8px 4px;
+        border-bottom: 1px solid #f3f4f6;
+        cursor: pointer;
+      }
+      .chat-item:hover {
+        background: #f9fafb;
+      }
+      .chat-item input {
+        margin-top: 2px;
+      }
+      .chat-meta {
+        flex: 1;
+        min-width: 0;
+      }
+      .chat-title {
+        font-size: 12px;
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .chat-date {
+        font-size: 11px;
+        color: #9ca3af;
+        margin-top: 2px;
+      }
+      .loading,
+      .empty,
+      .error-msg {
+        font-size: 12px;
+        color: #6b7280;
+        text-align: center;
+        padding: 24px 12px;
+      }
+      .error-msg {
+        color: #dc2626;
+      }
+      footer {
+        border-top: 1px solid #e5e7eb;
+        padding: 10px 12px;
+        background: #fafafa;
+      }
+      .selection-count {
+        font-size: 11px;
+        color: #6b7280;
+        margin-bottom: 8px;
+      }
+      .progress {
+        display: none;
+        margin-bottom: 8px;
+      }
+      .progress.visible {
+        display: block;
+      }
+      .progress-bar {
+        height: 6px;
         background: #e5e7eb;
+        border-radius: 3px;
+        overflow: hidden;
+        margin-bottom: 6px;
+      }
+      .progress-fill {
+        height: 100%;
+        background: #4f46e5;
+        width: 0%;
+        transition: width 0.2s;
+      }
+      .progress-text {
+        font-size: 11px;
+        color: #4b5563;
+        line-height: 1.3;
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
+      }
+      .btn {
+        flex: 1;
+        padding: 8px 10px;
+        font-size: 12px;
+        cursor: pointer;
+        border-radius: 6px;
+        border: 1px solid #d1d5db;
+        background: #f3f4f6;
+      }
+      .btn:hover:not(:disabled) {
+        background: #e5e7eb;
+      }
+      .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .btn-primary {
+        background: #4f46e5;
+        color: #fff;
+        border-color: #4f46e5;
+      }
+      .btn-primary:hover:not(:disabled) {
+        background: #4338ca;
+      }
+      .btn-secondary {
+        flex: 0 0 auto;
+        min-width: 72px;
+      }
+      .confirm-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.4);
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+        z-index: 10;
+      }
+      .confirm-overlay.visible {
+        display: flex;
+      }
+      .confirm-box {
+        background: #fff;
+        border-radius: 8px;
+        padding: 16px;
+        width: 100%;
+        max-width: 320px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+      }
+      .confirm-box p {
+        font-size: 13px;
+        margin: 0 0 14px;
+        line-height: 1.4;
+      }
+      .confirm-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+      }
+      .status-msg {
+        font-size: 11px;
+        color: #059669;
+        margin-top: 6px;
+        min-height: 14px;
+      }
+      .status-msg.error {
+        color: #dc2626;
       }
     </style>
   </head>
   <body>
-    <select id="structure">
-      <option value="flat">Flat structure</option>
-      <option value="structured">Inferred structure</option>
-    </select>
-    <button id="export">Export current chat</button>
+    <header>
+      <h1>Claude Export Hub</h1>
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="current" role="tab">This chat</button>
+        <button class="tab" data-tab="pick" role="tab">Pick chats</button>
+        <button class="tab" data-tab="all" role="tab">All chats</button>
+      </nav>
+    </header>
+
+    <div class="options">
+      <p class="options-label">Include per chat:</p>
+      <div class="checkbox-row">
+        <label class="checkbox-item">
+          <input type="checkbox" id="include-transcript" checked />
+          Transcript
+        </label>
+        <label class="checkbox-item">
+          <input type="checkbox" id="include-artifacts" checked />
+          Artifacts
+        </label>
+        <label class="checkbox-item">
+          <input type="checkbox" id="include-pasted" checked />
+          Pasted
+        </label>
+      </div>
+      <p class="include-hint" id="include-hint">Each chat folder: chat.md · artifacts/ · pasted/</p>
+    </div>
+
+    <section class="panel active" id="panel-current" role="tabpanel">
+      <div class="panel-body">
+        <p>Export the active chat as a folder. Use the checkboxes above to choose transcript, artifacts, and/or pasted content.</p>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-pick" role="tabpanel">
+      <div class="panel-body">
+        <p>Export selected chats into one ZIP — each chat gets its own folder with your checked content types.</p>
+        <div class="chat-toolbar">
+          <input type="search" id="search" placeholder="Search conversations…" />
+        </div>
+        <div class="chat-toolbar">
+          <span class="selection-count" id="selection-count">0 selected</span>
+          <button type="button" class="link-btn" id="select-visible">Select visible</button>
+          <button type="button" class="link-btn" id="clear-selection">Clear</button>
+        </div>
+        <div id="chat-list-container">
+          <div class="loading" id="list-loading">Loading conversations…</div>
+          <ul class="chat-list" id="chat-list" hidden></ul>
+          <div class="empty" id="list-empty" hidden>No conversations found.</div>
+          <div class="error-msg" id="list-error" hidden></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-all" role="tabpanel">
+      <div class="panel-body">
+        <p>Export every conversation into one ZIP — each chat in its own folder with your checked content types. Large libraries may take several minutes.</p>
+        <p id="all-count"></p>
+      </div>
+    </section>
+
+    <footer>
+      <div class="progress" id="progress">
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        <div class="progress-text" id="progress-text"></div>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn btn-secondary" id="cancel" hidden>Cancel</button>
+        <button type="button" class="btn btn-primary" id="export">Export this chat</button>
+      </div>
+      <div class="status-msg" id="status"></div>
+    </footer>
+
+    <div class="confirm-overlay" id="confirm-overlay">
+      <div class="confirm-box">
+        <p id="confirm-message"></p>
+        <div class="confirm-actions">
+          <button type="button" class="btn" id="confirm-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="confirm-ok">Export</button>
+        </div>
+      </div>
+    </div>
+
     <script src="popup.js"></script>
   </body>
 </html>
