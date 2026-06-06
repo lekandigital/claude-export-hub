@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Claude Export Hub",
   "version": "2.0",
-  "description": "Export Claude chats, transcripts, artifacts, and pasted content as organized ZIP archives",
+  "description": "Export Claude chats, transcripts, artifacts, pasted content, and optional visible thinking as organized ZIP archives",
   "permissions": [
     "tabs",
     "downloads",

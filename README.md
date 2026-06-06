@@ -1,6 +1,6 @@
 # Claude Export Hub
 
-Chrome extension for exporting Claude.ai conversations — transcripts, artifacts, pasted content, and attachment excerpts — as organized ZIP archives. All processing runs locally in your browser.
+Chrome extension for exporting Claude.ai conversations — transcripts, artifacts, pasted content, attachment excerpts, and optional visible thinking — as organized ZIP archives. All processing runs locally in your browser.
 
 ## What it does
 
@@ -16,13 +16,22 @@ Use the extension popup for all three modes. A floating in-page control on chat 
 
 ## Include options
 
-Each export uses checkboxes (all enabled by default):
+Each export uses checkboxes:
 
-- **Transcript** — full conversation as `chat.md`
-- **Artifacts** — Claude `<antArtifact>` files in `artifacts/`
-- **Pasted** — long pasted human messages in `pasted/`
+- **Transcript** — full conversation as `chat.md` (on by default)
+- **Artifacts** — Claude `<antArtifact>` files in `artifacts/` (on by default)
+- **Pasted** — long pasted human messages in `pasted/` (on by default)
+- **Visible thinking** — thinking Claude shows in the chat UI, in `thinking/` (off by default)
 
 Export is blocked if no content type is selected.
+
+### Visible thinking export
+
+Claude Export Hub can optionally export the thinking Claude visibly shows in the chat UI, when available. This includes the expandable thinking sections shown above Claude responses when extended thinking is enabled.
+
+This does **not** recover hidden, omitted, encrypted, or redacted reasoning. If Claude or Anthropic's API marks thinking as redacted or omitted, Claude Export Hub will only include a placeholder.
+
+For bulk exports (Pick chats / All chats), thinking is extracted from the conversation payload and any prior cache for that chat. Live DOM capture applies only when exporting the chat you currently have open.
 
 ## Folder layout
 
@@ -33,8 +42,11 @@ Chat_Title_a1b2c3d4/
   chat.md          # when Transcript is checked
   artifacts/       # when Artifacts is checked
   pasted/          # when Pasted is checked
+  thinking/        # when Visible thinking is checked
   skipped.txt      # optional notes when a category had nothing to export
 ```
+
+When visible thinking is exported, each block becomes a numbered markdown file under `thinking/`, plus a `thinking_index.json` manifest. Partial captures during an in-progress response are marked with a `_partial` suffix.
 
 Attachment and content-block excerpts are included **inline in `chat.md`** (quoted blocks), not in a separate `attachments/` folder.
 

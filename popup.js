@@ -10,6 +10,7 @@ const panels = {
 const includeTranscript = document.getElementById("include-transcript");
 const includeArtifacts = document.getElementById("include-artifacts");
 const includePasted = document.getElementById("include-pasted");
+const includeThinking = document.getElementById("include-thinking");
 const includeHint = document.getElementById("include-hint");
 const exportBtn = document.getElementById("export");
 const cancelBtn = document.getElementById("cancel");
@@ -31,7 +32,12 @@ const confirmMessage = document.getElementById("confirm-message");
 const confirmOk = document.getElementById("confirm-ok");
 const confirmCancel = document.getElementById("confirm-cancel");
 
-const includeCheckboxes = [includeTranscript, includeArtifacts, includePasted];
+const includeCheckboxes = [
+  includeTranscript,
+  includeArtifacts,
+  includePasted,
+  includeThinking,
+];
 
 let activeTab = "current";
 let conversations = [];
@@ -44,6 +50,7 @@ function getExportIncludes() {
     transcript: includeTranscript.checked,
     artifacts: includeArtifacts.checked,
     pasted: includePasted.checked,
+    thinking: includeThinking.checked,
   };
 }
 
@@ -57,6 +64,9 @@ function getCheckedLabels() {
   }
   if (includePasted.checked) {
     labels.push("pasted/");
+  }
+  if (includeThinking.checked) {
+    labels.push("thinking/");
   }
   return labels;
 }
@@ -97,6 +107,7 @@ async function loadPrefs() {
     includeTranscript.checked = prefs.includes.transcript !== false;
     includeArtifacts.checked = prefs.includes.artifacts !== false;
     includePasted.checked = prefs.includes.pasted !== false;
+    includeThinking.checked = prefs.includes.thinking === true;
   }
   if (prefs.activeTab) {
     switchTab(prefs.activeTab, false);

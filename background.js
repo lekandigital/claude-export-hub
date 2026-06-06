@@ -84,6 +84,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
 
+  if (request.action === "cacheVisibleThinking") {
+    handleCacheVisibleThinking(request)
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
   return false;
 });
 
@@ -260,6 +267,7 @@ const DEFAULT_EXPORT_INCLUDES = {
   transcript: true,
   artifacts: true,
   pasted: true,
+  thinking: false,
 };
 
 function normalizeExportIncludes(includes) {
@@ -268,11 +276,17 @@ function normalizeExportIncludes(includes) {
     transcript: src.transcript !== false,
     artifacts: src.artifacts !== false,
     pasted: src.pasted !== false,
+    thinking: src.thinking === true,
   };
 }
 
 function hasAnyExportInclude(includes) {
-  return includes.transcript || includes.artifacts || includes.pasted;
+  return (
+    includes.transcript ||
+    includes.artifacts ||
+    includes.pasted ||
+    includes.thinking
+  );
 }
 
 function resolveExportIncludes(request) {
@@ -309,6 +323,7 @@ function createCategorySkipRecord(payload, type, reason) {
     transcript: "Transcript",
     artifacts: "Artifacts",
     pasted: "Pasted",
+    thinking: "Visible thinking",
   };
   return {
     type,
@@ -624,7 +639,248 @@ function collectCategorizedItemsFromPayload(payload) {
   return { artifacts, pasted };
 }
 
-function writeStructuredChatToZip(zip, payload, exportIncludes, folderPrefix) {
+function collectThinkingItems(message) {
+  const items = [];
+
+  if (!Array.isArray(message.content)) {
+    return items;
+  }
+
+  for (const [index, block] of message.content.entries()) {
+    if (block.type === "thinking") {
+      const content =
+        block.thinking ||
+        block.text ||
+        block.content ||
+        block.summary ||
+        "";
+
+      if (typeof content === "string" && content.trim()) {
+        items.push({
+          source: "payload",
+          kind: "thinking",
+          blockIndex: index,
+          title: block.title || block.summary_title || "Visible thinking",
+          content: content.trim(),
+          signature: block.signature || null,
+        });
+      } else if (block.display === "omitted") {
+        items.push({
+          source: "payload",
+          kind: "thinking",
+          blockIndex: index,
+          title: "Visible thinking",
+          content: "[Thinking omitted]",
+        });
+      }
+    }
+
+    if (block.type === "redacted_thinking") {
+      items.push({
+        source: "payload",
+        kind: "redacted_thinking",
+        blockIndex: index,
+        title: "Redacted thinking",
+        content:
+          "[Redacted thinking block present. The readable content is not available.]",
+        redacted: true,
+        dataLength: typeof block.data === "string" ? block.data.length : 0,
+      });
+    }
+  }
+
+  return items;
+}
+
+function collectThinkingFromPayload(payload) {
+  const items = [];
+  for (const message of getActiveBranchMessages(payload)) {
+    if (message.sender !== "assistant") {
+      continue;
+    }
+    for (const item of collectThinkingItems(message)) {
+      items.push({
+        ...item,
+        messageUuid: message.uuid,
+        messageIndex: message.index,
+      });
+    }
+  }
+  return items;
+}
+
+function thinkingDedupeKey(item) {
+  return `${item.kind || "thinking"}:${(item.content || "").slice(0, 160)}`;
+}
+
+function domBlockToThinkingItem(block, capturedAt) {
+  const partial = block.streaming === true;
+  return {
+    source: "dom",
+    kind: "thinking",
+    title: block.title || "Visible thinking",
+    content: block.content || "",
+    partial,
+    streaming: partial,
+    turnIndex: block.turnIndex,
+    blockIndex: block.blockIndex,
+    capturedAt:
+      partial && capturedAt
+        ? new Date(capturedAt).toISOString()
+        : partial
+          ? new Date().toISOString()
+          : undefined,
+  };
+}
+
+async function getVisibleThinkingForChat(uuid) {
+  const result = await chrome.storage.local.get([`visible_thinking_${uuid}`]);
+  const entry = result[`visible_thinking_${uuid}`];
+  if (!entry) {
+    return { blocks: [], updatedAt: null };
+  }
+  return {
+    blocks: entry.blocks || [],
+    updatedAt: entry.updatedAt || null,
+  };
+}
+
+async function getVisibleThinkingFromTab(tabId, uuid) {
+  if (!tabId || !uuid) {
+    return [];
+  }
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!CHAT_URL_PATTERN.test(tab.url || "")) {
+      return [];
+    }
+    const tabUuid = tab.url.match(/\/chat\/([0-9a-f-]{36})/i)?.[1];
+    if (tabUuid !== uuid) {
+      return [];
+    }
+    const response = await chrome.tabs.sendMessage(tabId, {
+      action: "getVisibleThinking",
+      uuid,
+    });
+    return response?.blocks || [];
+  } catch {
+    return [];
+  }
+}
+
+async function collectThinkingForChat(payload, tabId, uuid) {
+  const byKey = new Map();
+  const chatUuid = uuid || payload.uuid;
+
+  for (const item of collectThinkingFromPayload(payload)) {
+    byKey.set(thinkingDedupeKey(item), item);
+  }
+
+  const cachedDom = await getVisibleThinkingForChat(chatUuid);
+  for (const block of cachedDom.blocks) {
+    const item = domBlockToThinkingItem(block, cachedDom.updatedAt);
+    const key = thinkingDedupeKey(item);
+    if (!byKey.has(key)) {
+      byKey.set(key, item);
+    }
+  }
+
+  const liveDom = await getVisibleThinkingFromTab(tabId, chatUuid);
+  for (const block of liveDom) {
+    const item = domBlockToThinkingItem(block);
+    const key = thinkingDedupeKey(item);
+    if (!byKey.has(key)) {
+      byKey.set(key, item);
+    }
+  }
+
+  return [...byKey.values()];
+}
+
+async function handleCacheVisibleThinking(request) {
+  if (!request.uuid || !Array.isArray(request.blocks)) {
+    return { ok: false };
+  }
+
+  await chrome.storage.local.set({
+    [`visible_thinking_${request.uuid}`]: {
+      uuid: request.uuid,
+      blocks: request.blocks,
+      updatedAt: request.updatedAt || Date.now(),
+    },
+  });
+
+  return { ok: true };
+}
+
+function writeThinkingToZip(zip, folderPrefix, thinkingItems) {
+  if (!thinkingItems.length) {
+    return 0;
+  }
+
+  let count = 0;
+  const indexEntries = [];
+
+  for (const item of thinkingItems) {
+    count += 1;
+
+    const base = sanitizeFilename(
+      `${String(count).padStart(4, "0")}_${item.title || "visible_thinking"}`,
+    );
+    const suffix = item.partial ? "_partial" : "";
+    const filename = `${folderPrefix}thinking/${base}${suffix}.md`;
+
+    const frontmatter = [
+      "---",
+      `source: ${item.source || "payload"}`,
+      `kind: ${item.kind || "thinking"}`,
+      `partial: ${item.partial ? "true" : "false"}`,
+      `streaming: ${item.streaming ? "true" : "false"}`,
+    ];
+    if (item.signature) {
+      frontmatter.push(`signature: ${item.signature}`);
+    }
+    if (item.partial && item.capturedAt) {
+      frontmatter.push(`captured_at: ${item.capturedAt}`);
+    }
+    frontmatter.push("---");
+
+    zip.file(
+      filename,
+      [
+        ...frontmatter,
+        "",
+        `# ${item.title || "Visible thinking"}`,
+        "",
+        item.content || "",
+        "",
+      ].join("\n"),
+    );
+
+    indexEntries.push({
+      filename: `${base}${suffix}.md`,
+      title: item.title,
+      source: item.source,
+      kind: item.kind,
+      partial: !!item.partial,
+    });
+  }
+
+  zip.file(
+    `${folderPrefix}thinking/thinking_index.json`,
+    JSON.stringify(indexEntries, null, 2),
+  );
+
+  return count;
+}
+
+function writeStructuredChatToZip(
+  zip,
+  payload,
+  exportIncludes,
+  folderPrefix,
+  thinkingItems = [],
+) {
   let fileCount = 0;
   const skipped = [];
   const chatName = payload.name || "Untitled";
@@ -697,6 +953,20 @@ function writeStructuredChatToZip(zip, payload, exportIncludes, folderPrefix) {
     }
   }
 
+  if (exportIncludes.thinking) {
+    if (thinkingItems.length === 0) {
+      skipped.push(
+        createCategorySkipRecord(
+          payload,
+          "thinking",
+          "No visible thinking found",
+        ),
+      );
+    } else {
+      fileCount += writeThinkingToZip(zip, folderPrefix, thinkingItems);
+    }
+  }
+
   if (skipped.length > 0) {
     zip.file(
       `${folderPrefix}skipped.txt`,
@@ -712,11 +982,17 @@ async function addChatToZip(zip, payload, options) {
   const { exportIncludes, tabId, uuid, tryRawSupplement = false } = options;
   const folderPrefix = buildChatFolderPrefix(payload);
 
+  let thinkingItems = [];
+  if (exportIncludes.thinking) {
+    thinkingItems = await collectThinkingForChat(payload, tabId, uuid);
+  }
+
   let result = writeStructuredChatToZip(
     zip,
     payload,
     exportIncludes,
     folderPrefix,
+    thinkingItems,
   );
 
   if (result.fileCount === 0 && tryRawSupplement && tabId && uuid) {
@@ -724,11 +1000,19 @@ async function addChatToZip(zip, payload, options) {
       rawOnly: true,
     });
     if (rawSupplement.payload) {
+      if (exportIncludes.thinking) {
+        thinkingItems = await collectThinkingForChat(
+          rawSupplement.payload,
+          tabId,
+          uuid,
+        );
+      }
       result = writeStructuredChatToZip(
         zip,
         rawSupplement.payload,
         exportIncludes,
         folderPrefix,
+        thinkingItems,
       );
       if (result.fileCount > 0) {
         await storeChatPayload(rawSupplement.payload);

@@ -321,8 +321,15 @@
           <input type="checkbox" id="include-pasted" checked />
           Pasted
         </label>
+        <label
+          class="checkbox-item"
+          title="Exports the thinking Claude visibly shows in the chat, when available. Redacted or omitted thinking cannot be recovered."
+        >
+          <input type="checkbox" id="include-thinking" />
+          Visible thinking
+        </label>
       </div>
-      <p class="include-hint" id="include-hint">Each chat folder: chat.md · artifacts/ · pasted/</p>
+      <p class="include-hint" id="include-hint">Each chat folder: chat.md · artifacts/ · pasted/ · thinking/</p>
     </div>
 
     <section class="panel active" id="panel-current" role="tabpanel">
