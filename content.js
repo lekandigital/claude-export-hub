@@ -11,67 +11,55 @@ function isChatPage(url) {
   return CHAT_PAGE_PATTERN.test(url);
 }
 
-function findButtonContainer() {
-  const selectors = [
-    ".flex.min-w-0.items-center.max-md\\:text-sm",
-    "header .flex.items-center",
-    "header [class*='flex'][class*='items-center']",
-  ];
+function createDownloadContainer() {
+  const downloadContainer = document.createElement("div");
+  downloadContainer.className =
+    "claude-download-container flex items-center gap-2 shrink-0";
+  downloadContainer.setAttribute("data-claude-downloader", "true");
 
-  for (const selector of selectors) {
-    const container = document.querySelector(selector);
-    if (container) {
-      return container;
-    }
+  const downloadButton = createButton("Download artifacts");
+  const optionsDropdown = createOptionsDropdown();
+
+  downloadContainer.appendChild(optionsDropdown);
+  downloadContainer.appendChild(downloadButton);
+  return downloadContainer;
+}
+
+function injectFloatingButton() {
+  if (document.querySelector(".claude-download-button")) {
+    return false;
   }
 
-  const shareButton = Array.from(
-    document.querySelectorAll("header button, header a"),
-  ).find((el) => el.textContent.trim().toLowerCase().includes("share"));
+  const downloadContainer = createDownloadContainer();
+  downloadContainer.style.cssText =
+    "position: fixed; bottom: 88px; right: 16px; z-index: 40; display: flex; align-items: center; gap: 8px; pointer-events: auto;";
 
-  if (shareButton) {
-    return (
-      shareButton.closest(".flex.items-center") ||
-      shareButton.parentElement
-    );
-  }
-
-  const header = document.querySelector("header");
-  if (header) {
-    return header.querySelector(".flex.items-center") || header;
-  }
-
-  return null;
+  document.body.appendChild(downloadContainer);
+  console.log(
+    LOG_PREFIX,
+    "button injected successfully (floating, bottom-right)",
+  );
+  return true;
 }
 
 function addDownloadButton() {
-  const buttonContainer = findButtonContainer();
+  if (document.querySelector(".claude-download-button")) {
+    console.log(LOG_PREFIX, "injection skipped, button already exists");
+    return false;
+  }
 
-  if (
-    buttonContainer &&
-    !buttonContainer.querySelector(".claude-download-button")
-  ) {
-    const downloadContainer = document.createElement("div");
-    downloadContainer.className =
-      "claude-download-container ml-1 flex items-center";
-
-    const downloadButton = createButton("Download artifacts");
-    const optionsDropdown = createOptionsDropdown();
-
-    downloadContainer.appendChild(optionsDropdown);
-    downloadContainer.appendChild(downloadButton);
-    buttonContainer.appendChild(downloadContainer);
-    console.log(LOG_PREFIX, "button injected successfully");
+  if (injectFloatingButton()) {
     return true;
   }
 
+  console.warn(LOG_PREFIX, "no safe insertion target found");
   return false;
 }
 
 function createButton(text) {
   const button = document.createElement("button");
   button.className =
-    "claude-download-button ml-1 flex items-center rounded-md bg-gray-100 py-1 px-3 text-sm font-medium text-gray-800 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2";
+    "claude-download-button flex items-center rounded-md bg-gray-100 py-1 px-3 text-sm font-medium text-gray-800 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md";
   button.type = "button";
   button.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>${text}`;
   button.addEventListener("click", downloadArtifacts);
@@ -81,7 +69,7 @@ function createButton(text) {
 function createOptionsDropdown() {
   const select = document.createElement("select");
   select.className =
-    "claude-download-options rounded-md bg-gray-100 py-1 px-2 text-sm font-medium text-gray-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2";
+    "claude-download-options rounded-md bg-gray-100 py-1 px-2 text-sm font-medium text-gray-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 shadow-md";
 
   const flatOption = document.createElement("option");
   flatOption.value = "flat";
@@ -104,14 +92,30 @@ function downloadArtifacts() {
     return;
   }
 
+  console.log(LOG_PREFIX, "export requested for", uuid);
   const optionsDropdown = document.querySelector(".claude-download-options");
   const useDirectoryStructure = optionsDropdown?.value === "structured";
 
-  chrome.runtime.sendMessage({
-    action: "downloadArtifacts",
-    uuid: uuid,
-    useDirectoryStructure: useDirectoryStructure,
-  });
+  chrome.runtime.sendMessage(
+    {
+      action: "downloadArtifacts",
+      uuid: uuid,
+      useDirectoryStructure: useDirectoryStructure,
+    },
+    (response) => {
+      if (chrome.runtime.lastError) {
+        const msg = chrome.runtime.lastError.message;
+        console.log(LOG_PREFIX, "export failure:", msg);
+        createBanner(msg, "error", 3000);
+        return;
+      }
+      if (response?.success) {
+        console.log(LOG_PREFIX, "export success:", response.message);
+      } else if (response?.error) {
+        console.log(LOG_PREFIX, "export failure:", response.error);
+      }
+    },
+  );
 }
 
 let domObserver = null;
@@ -134,7 +138,10 @@ function startDomObserver() {
     if (domObserver) {
       domObserver.disconnect();
       domObserver = null;
-      console.warn(LOG_PREFIX, "MutationObserver timed out without finding container");
+      console.warn(
+        LOG_PREFIX,
+        "MutationObserver timed out without finding container",
+      );
     }
   }, 30000);
 }
@@ -145,11 +152,17 @@ function checkAndAddShareButtons() {
     return;
   }
 
+  const uuid = extractChatUuid(window.location.href);
+  if (uuid) {
+    console.log(LOG_PREFIX, "extracted conversation UUID from URL:", uuid);
+  }
+
   const maxAttempts = 15;
   let attempts = 0;
 
   function tryAddButtons() {
     if (document.querySelector(".claude-download-button")) {
+      console.log(LOG_PREFIX, "injection skipped, button already exists");
       return;
     }
 
@@ -180,13 +193,33 @@ function checkAndAddShareButtons() {
 console.log(LOG_PREFIX, "content script loaded on", window.location.href);
 checkAndAddShareButtons();
 
-chrome.runtime.onMessage.addListener((request) => {
+chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  if (request.action === "listenForPayload") {
+    const eventName = `cad-payload-${request.uuid}`;
+    console.log(LOG_PREFIX, "listening for page payload event:", eventName);
+    document.addEventListener(
+      eventName,
+      (event) => {
+        const detail = event.detail ?? {
+          payload: null,
+          error: "empty page payload event",
+        };
+        sendResponse(detail);
+      },
+      { once: true },
+    );
+    return true;
+  }
+
   if (request.action === "artifactsProcessed") {
     if (request.success) {
+      console.log(LOG_PREFIX, "export success:", request.message);
       createBanner(request.message, "success", 1000);
     } else if (request.failure) {
+      console.log(LOG_PREFIX, "export failure:", request.message);
       createBanner(request.message, "error", 3000);
     } else if (request.message) {
+      console.log(LOG_PREFIX, "export failure:", request.message);
       createBanner(request.message, "error", 3000);
     }
   } else if (request.action === "checkAndAddDownloadButton") {
