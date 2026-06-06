@@ -1,55 +1,93 @@
-function addDownloadButton() {
-  let buttonContainer = document.querySelector(
+const LOG_PREFIX = "[Claude Artifact Downloader]";
+const CHAT_UUID_PATTERN = /\/chat\/([0-9a-f-]{36})/i;
+const CHAT_PAGE_PATTERN = /^https:\/\/claude\.ai\/chat\/[^/]+/i;
+
+function extractChatUuid(url) {
+  const match = url.match(CHAT_UUID_PATTERN);
+  return match ? match[1] : null;
+}
+
+function isChatPage(url) {
+  return CHAT_PAGE_PATTERN.test(url);
+}
+
+function findButtonContainer() {
+  const selectors = [
     ".flex.min-w-0.items-center.max-md\\:text-sm",
-  );
+    "header .flex.items-center",
+    "header [class*='flex'][class*='items-center']",
+  ];
+
+  for (const selector of selectors) {
+    const container = document.querySelector(selector);
+    if (container) {
+      return container;
+    }
+  }
+
+  const shareButton = Array.from(
+    document.querySelectorAll("header button, header a"),
+  ).find((el) => el.textContent.trim().toLowerCase().includes("share"));
+
+  if (shareButton) {
+    return (
+      shareButton.closest(".flex.items-center") ||
+      shareButton.parentElement
+    );
+  }
+
+  const header = document.querySelector("header");
+  if (header) {
+    return header.querySelector(".flex.items-center") || header;
+  }
+
+  return null;
+}
+
+function addDownloadButton() {
+  const buttonContainer = findButtonContainer();
 
   if (
     buttonContainer &&
     !buttonContainer.querySelector(".claude-download-button")
   ) {
-    let faLink = document.createElement("link");
-    faLink.rel = "stylesheet";
-    faLink.href =
-      "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css";
-    document.head.appendChild(faLink);
-
-    let downloadContainer = document.createElement("div");
+    const downloadContainer = document.createElement("div");
     downloadContainer.className =
       "claude-download-container ml-1 flex items-center";
 
-    let downloadButton = createButton(
-      "download",
-      "Download artifacts",
-      "downloadArtifacts",
-    );
-
-    let optionsDropdown = createOptionsDropdown();
+    const downloadButton = createButton("Download artifacts");
+    const optionsDropdown = createOptionsDropdown();
 
     downloadContainer.appendChild(optionsDropdown);
     downloadContainer.appendChild(downloadButton);
     buttonContainer.appendChild(downloadContainer);
+    console.log(LOG_PREFIX, "button injected successfully");
+    return true;
   }
+
+  return false;
 }
 
-function createButton(icon, text, onClick) {
-  let button = document.createElement("button");
+function createButton(text) {
+  const button = document.createElement("button");
   button.className =
     "claude-download-button ml-1 flex items-center rounded-md bg-gray-100 py-1 px-3 text-sm font-medium text-gray-800 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2";
-  button.innerHTML = `<i class="fa fa-${icon} mr-2"></i>${text}`;
-  button.onclick = window[onClick];
+  button.type = "button";
+  button.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>${text}`;
+  button.addEventListener("click", downloadArtifacts);
   return button;
 }
 
 function createOptionsDropdown() {
-  let select = document.createElement("select");
+  const select = document.createElement("select");
   select.className =
     "claude-download-options rounded-md bg-gray-100 py-1 px-2 text-sm font-medium text-gray-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2";
 
-  let flatOption = document.createElement("option");
+  const flatOption = document.createElement("option");
   flatOption.value = "flat";
   flatOption.textContent = "Flat structure";
 
-  let structuredOption = document.createElement("option");
+  const structuredOption = document.createElement("option");
   structuredOption.value = "structured";
   structuredOption.textContent = "Inferred structure";
 
@@ -60,10 +98,15 @@ function createOptionsDropdown() {
 }
 
 function downloadArtifacts() {
-  const url = new URL(window.location.href);
-  const uuid = url.pathname.split("/").pop();
+  const uuid = extractChatUuid(window.location.href);
+  if (!uuid) {
+    createBanner("No conversation UUID found in URL.", "error", 3000);
+    return;
+  }
+
   const optionsDropdown = document.querySelector(".claude-download-options");
-  const useDirectoryStructure = optionsDropdown.value === "structured";
+  const useDirectoryStructure = optionsDropdown?.value === "structured";
+
   chrome.runtime.sendMessage({
     action: "downloadArtifacts",
     uuid: uuid,
@@ -71,40 +114,82 @@ function downloadArtifacts() {
   });
 }
 
-function checkAndAddShareButtons() {
-  if (window.location.href.startsWith("https://claude.ai/chat/")) {
-    const maxAttempts = 15;
-    let attempts = 0;
+let domObserver = null;
 
-    function tryAddButtons() {
-      if (attempts < maxAttempts) {
-        addDownloadButton();
-        if (!document.querySelector(".claude-download-button")) {
-          attempts++;
-          setTimeout(tryAddButtons, 1000);
-        }
-      } else {
-        console.log("Failed to add share buttons after maximum attempts");
-      }
-    }
-    tryAddButtons();
+function startDomObserver() {
+  if (domObserver) {
+    return;
   }
+
+  domObserver = new MutationObserver(() => {
+    if (addDownloadButton()) {
+      domObserver.disconnect();
+      domObserver = null;
+    }
+  });
+
+  domObserver.observe(document.body, { childList: true, subtree: true });
+
+  setTimeout(() => {
+    if (domObserver) {
+      domObserver.disconnect();
+      domObserver = null;
+      console.warn(LOG_PREFIX, "MutationObserver timed out without finding container");
+    }
+  }, 30000);
 }
 
-// for already cached pages
+function checkAndAddShareButtons() {
+  if (!isChatPage(window.location.href)) {
+    console.log(LOG_PREFIX, "not a chat page, skipping button injection");
+    return;
+  }
+
+  const maxAttempts = 15;
+  let attempts = 0;
+
+  function tryAddButtons() {
+    if (document.querySelector(".claude-download-button")) {
+      return;
+    }
+
+    attempts++;
+    console.log(
+      LOG_PREFIX,
+      `attempting button injection (attempt ${attempts}/${maxAttempts})`,
+    );
+
+    if (addDownloadButton()) {
+      return;
+    }
+
+    if (attempts < maxAttempts) {
+      setTimeout(tryAddButtons, 1000);
+    } else {
+      console.warn(
+        LOG_PREFIX,
+        `container not found after ${maxAttempts} attempts, starting MutationObserver`,
+      );
+      startDomObserver();
+    }
+  }
+
+  tryAddButtons();
+}
+
+console.log(LOG_PREFIX, "content script loaded on", window.location.href);
 checkAndAddShareButtons();
 
-// Listen for messages from the background script
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((request) => {
   if (request.action === "artifactsProcessed") {
     if (request.success) {
       createBanner(request.message, "success", 1000);
     } else if (request.failure) {
-      createBanner(request.message, "error", 1000);
+      createBanner(request.message, "error", 3000);
+    } else if (request.message) {
+      createBanner(request.message, "error", 3000);
     }
   } else if (request.action === "checkAndAddDownloadButton") {
-    // Observe DOM changes to add the button when the container is available
     checkAndAddShareButtons();
   }
-  return true;
 });
