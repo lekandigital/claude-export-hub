@@ -1,6 +1,6 @@
 # Claude Export Hub
 
-Chrome extension for exporting Claude.ai conversations — transcripts, artifacts, pasted content, attachment excerpts, and visible thinking (toggleable per export) — as organized ZIP archives. All processing runs locally in your browser.
+Chrome extension for exporting Claude.ai conversations — transcripts, artifacts, pasted content, attachment excerpts, and visible thinking/status panels (toggleable per export) — as organized ZIP archives. All processing runs locally in your browser.
 
 ## What it does
 
@@ -19,19 +19,23 @@ Use the extension popup for all three modes. A floating in-page control on chat 
 Each export uses checkboxes:
 
 - **Transcript** — full conversation as `chat.md` (on by default)
-- **Artifacts** — Claude `<antArtifact>` files in `artifacts/` (on by default)
+- **Artifacts** — Claude files and exportable payloads in `artifacts/`, plus related folders (on by default)
 - **Pasted** — long pasted human messages in `pasted/` (on by default)
-- **Visible thinking** — thinking Claude shows in the chat UI, in `thinking/` (on by default)
+- **Visible thinking** — status/thinking panels Claude shows in the chat UI, in `thinking/` (on by default)
 
 Export is blocked if no content type is selected.
 
 ### Visible thinking export
 
-Claude Export Hub can optionally export the thinking Claude visibly shows in the chat UI, when available. This includes the expandable thinking sections shown above Claude responses when extended thinking is enabled.
+Claude Export Hub exports **only the thinking and status panels Claude visibly shows in the chat UI**, when available. This includes expandable sections such as:
 
-This does **not** recover hidden, omitted, encrypted, or redacted reasoning. If Claude or Anthropic's API marks thinking as redacted or omitted, Claude Export Hub will only include a placeholder.
+- Extended thinking summaries (for example, “Synthesizing…”)
+- Tool/status panels (for example, “Viewed files”, “Edited files”, “Presented files”)
+- Progress labels (for example, “Retrieving complete source code”, “Diagnosing code block clipping issue”)
 
-For bulk exports (Pick chats / All chats), thinking is extracted from the conversation payload and any prior cache for that chat. Live DOM capture applies only when exporting the chat you currently have open.
+This does **not** recover hidden, omitted, encrypted, or redacted reasoning. If Claude or Anthropic's API marks thinking as redacted or omitted, Claude Export Hub will only include an official placeholder.
+
+For bulk exports (Pick chats / All chats), thinking is extracted from the conversation payload, a **automatic per-chat page visit** that scrapes visible status panels from the rendered UI, and any prior cache for that chat. During bulk export with **Visible thinking** enabled, the extension briefly opens each selected chat in your Claude tab, expands status panels where possible, captures the visible text, then restores your original tab URL when finished. Live DOM capture without navigation applies when exporting the chat you currently have open (**This chat**).
 
 ## Folder layout
 
@@ -39,16 +43,20 @@ Each exported chat gets its own folder inside the ZIP:
 
 ```
 Chat_Title_a1b2c3d4/
-  chat.md          # when Transcript is checked
-  artifacts/       # when Artifacts is checked
-  pasted/          # when Pasted is checked
-  thinking/        # when Visible thinking is checked
-  skipped.txt      # optional notes when a category had nothing to export
+  chat.md               # when Transcript is checked
+  artifacts/            # <antArtifact> and artifact-like content blocks
+  attachments/          # uploaded attachment excerpts with usable text
+  presented-files/      # presented file payloads (for example files_v2)
+  generated-files/      # generated/tool output files
+  files_index.json      # manifest of exported files across the folders above
+  pasted/               # when Pasted is checked
+  thinking/             # when Visible thinking is checked
+  skipped.txt           # optional notes when a category had nothing to export
 ```
 
-When visible thinking is exported, each block becomes a numbered markdown file under `thinking/`, plus a `thinking_index.json` manifest. Partial captures during an in-progress response are marked with a `_partial` suffix.
+When visible thinking/status panels are exported, each block becomes a numbered markdown file under `thinking/`, plus a `thinking_index.json` manifest. Partial captures during an in-progress response are marked with a `_partial` suffix. Status panel files include `expanded` / `collapsed` metadata when detectable.
 
-Attachment and content-block excerpts are included **inline in `chat.md`** (quoted blocks), not in a separate `attachments/` folder.
+Attachment and content-block excerpts are also included **inline in `chat.md`** (quoted blocks), in addition to any standalone files saved under `attachments/`, `presented-files/`, or `generated-files/`.
 
 ## Privacy
 
@@ -59,16 +67,51 @@ Attachment and content-block excerpts are included **inline in `chat.md`** (quot
 ## Known limitations
 
 - Claude's UI and API can change without notice; exports may need updates
-- Attachments may appear as extracted text in `chat.md` depending on Claude's payload shape
+- Collapsed status panels may export title-only placeholders when body text is not rendered in the DOM
+- DOM artifact cards (for example PDF preview tiles) are not downloaded as binaries unless the API payload includes extractable text
 - Visible thinking export captures what Claude shows in the UI, not hidden or encrypted reasoning
-- Large bulk exports can take time; progress and cancel are available in the popup
+- Large bulk exports can take time; progress and cancel are available in the popup. Bulk exports with **Visible thinking** visit each chat in the browser (~3–5 seconds per chat) to capture status panels.
 - Not affiliated with or endorsed by Anthropic
 
 ## Troubleshooting
 
 - **"Could not connect to Claude tab"** — After reloading the extension, refresh any open claude.ai tabs and try again. Bulk exports (Pick chats / All chats) need an open Claude tab; the extension will reconnect automatically when possible.
-- **No thinking/ folder** — Uncheck/re-check **Visible thinking**, expand thinking sections in the chat, then re-export. Redacted or omitted thinking cannot be recovered.
+- **No thinking/ folder** — Uncheck/re-check **Visible thinking**, then re-export. For **Pick chats** / **All chats**, the extension visits each chat automatically to scrape status panels; keep a claude.ai tab open and allow the export to finish (the tab will flip through chats and restore your original URL at the end). Redacted or omitted thinking cannot be recovered.
+- **No artifacts found** — Confirm **Artifacts** is checked. Newer chats may store files under `files`, `files_v2`, or content blocks instead of `<antArtifact>` tags. If Claude only shows a file card without extractable text in the API payload, the exporter can include metadata in `chat.md` but not a standalone file.
 - **Export seems stuck** — Use Cancel in the popup; large All chats exports can take several minutes.
+- **Debug counts** — Open the service worker console (`chrome://extensions` → Claude Export Hub → Service worker). Each export logs a one-line diagnostics summary with message, file, and status-panel counts.
+
+## Development and fixture tests
+
+Install dev dependencies:
+
+```bash
+npm install
+```
+
+Run all tests (synthetic payload tests + saved Claude HTML fixtures):
+
+```bash
+npm test
+```
+
+Run only fixture HTML tests:
+
+```bash
+npm run test:fixtures
+```
+
+Fixture pages live outside the repo by default at:
+
+`/Users/lekan/Downloads/cchats_for_coding/split-pages`
+
+Override with:
+
+```bash
+CAD_FIXTURE_ROOT=/path/to/split-pages npm run test:fixtures
+```
+
+Fixture folders are read-only reference HTML. Tests load each folder's `index.html` with JSDOM and verify status-panel extraction against the current Claude DOM shape.
 
 ## Installation
 

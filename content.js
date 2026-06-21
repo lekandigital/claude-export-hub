@@ -3,106 +3,59 @@ const CHAT_UUID_PATTERN = /\/chat\/([0-9a-f-]{36})/i;
 const CHAT_PAGE_PATTERN = /^https:\/\/claude\.ai\/chat\/[^/]+/i;
 const PREFS_KEY = "exportPreferences";
 
-function cleanText(text) {
-  return String(text || "")
-    .replace(/\s+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/[ \t]{2,}/g, " ")
-    .trim();
-}
-
-function looksLikeThinkingTitle(title) {
-  if (!title) {
-    return false;
-  }
-
-  const lower = title.toLowerCase();
-
-  if (lower.includes("thinking")) {
-    return true;
-  }
-  if (lower.includes("synthesizing")) {
-    return true;
-  }
-  if (lower.includes("analyzing")) {
-    return true;
-  }
-  if (lower.includes("reviewing")) {
-    return true;
-  }
-  if (lower.includes("checking")) {
-    return true;
-  }
-  if (lower.includes("curating")) {
-    return true;
-  }
-  if (lower.includes("planning")) {
-    return true;
-  }
-  if (lower.includes("extracting")) {
-    return true;
-  }
-
-  return false;
-}
-
-function dedupeTitleFromBody(title, body) {
-  let output = body.trim();
-
-  while (output.startsWith(title)) {
-    output = output.slice(title.length).trim();
-  }
-
-  return output;
-}
-
 function collectVisibleThinkingFromDom() {
-  const turns = [...document.querySelectorAll("[data-is-streaming]")];
-  const results = [];
+  if (typeof CadExportCore?.collectVisibleStatusFromDom === "function") {
+    return CadExportCore.collectVisibleStatusFromDom(document);
+  }
+  return [];
+}
 
-  for (const [turnIndex, turn] of turns.entries()) {
-    const statusButtons = [...turn.querySelectorAll("button[aria-expanded]")];
+function delayMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-    for (const [blockIndex, button] of statusButtons.entries()) {
-      const title = cleanText(button.innerText);
+async function preparePageForThinkingScrape(options = {}) {
+  window.scrollTo(0, document.body.scrollHeight);
+  await delayMs(250);
+  window.scrollTo(0, 0);
+  await delayMs(150);
 
-      if (!looksLikeThinkingTitle(title)) {
-        continue;
-      }
-
-      const blockRoot =
-        button.closest(".grid") ||
-        button.closest("[class*='grid-rows']") ||
-        button.parentElement?.parentElement?.parentElement;
-
-      const bodyCandidates = [
-        blockRoot?.querySelector("[class*='row-start-2']"),
-        blockRoot?.querySelector("[class*='font-ui']"),
-        blockRoot,
-      ].filter(Boolean);
-
-      const body = cleanText(
-        bodyCandidates
-          .map((el) => el.innerText || "")
-          .sort((a, b) => b.length - a.length)[0] || "",
-      );
-
-      const content = dedupeTitleFromBody(title, body);
-
-      if (content && content.length > 40) {
-        results.push({
-          source: "dom",
-          turnIndex,
-          blockIndex,
-          title,
-          content,
-          streaming: turn.getAttribute("data-is-streaming") === "true",
-        });
-      }
+  let expandedCount = 0;
+  if (options.expandPanels !== false) {
+    const collapsed = [
+      ...document.querySelectorAll(
+        'button[class*="group/status"][aria-expanded="false"]',
+      ),
+    ];
+    for (const button of collapsed) {
+      button.click();
+      expandedCount += 1;
+    }
+    if (expandedCount > 0) {
+      await delayMs(options.expandDelayMs || 600);
     }
   }
 
-  return results;
+  return expandedCount;
+}
+
+function probeChatDomReady() {
+  const statusCount = document.querySelectorAll(
+    'button[class*="group/status"]',
+  ).length;
+  const responseCount = document.querySelectorAll(
+    '.font-claude-response-body, [class*="font-claude-response"]',
+  ).length;
+  const humanCount = document.querySelectorAll(
+    "textarea, .font-user-message",
+  ).length;
+
+  return {
+    ready: statusCount > 0 || responseCount > 0 || humanCount > 0,
+    statusCount,
+    responseCount,
+    humanCount,
+  };
 }
 
 function extractChatUuid(url) {
@@ -341,6 +294,14 @@ function flushThinkingCache() {
   }
 
   const blocks = collectVisibleThinkingFromDom();
+  if (blocks.length) {
+    console.log(
+      LOG_PREFIX,
+      "cached visible status/thinking blocks:",
+      blocks.length,
+    );
+  }
+
   chrome.runtime.sendMessage(
     {
       action: "cacheVisibleThinking",
@@ -504,6 +465,41 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     }
     sendResponse({ blocks: collectVisibleThinkingFromDom() });
     return false;
+  }
+
+  if (request.action === "probeChatDom") {
+    const currentUuid = extractChatUuid(window.location.href);
+    if (currentUuid !== request.uuid) {
+      sendResponse({
+        ready: false,
+        reason: "wrong-url",
+        currentUuid,
+      });
+      return false;
+    }
+    sendResponse(probeChatDomReady());
+    return false;
+  }
+
+  if (request.action === "scrapeVisibleThinking") {
+    const currentUuid = extractChatUuid(window.location.href);
+    if (currentUuid !== request.uuid) {
+      sendResponse({ blocks: [], error: "wrong chat page" });
+      return false;
+    }
+
+    preparePageForThinkingScrape({
+      expandPanels: request.expandPanels !== false,
+      expandDelayMs: request.expandDelayMs,
+    })
+      .then((expandedCount) => {
+        const blocks = collectVisibleThinkingFromDom();
+        sendResponse({ blocks, expandedCount });
+      })
+      .catch((error) => {
+        sendResponse({ blocks: [], error: error.message });
+      });
+    return true;
   }
 
   if (request.action === "artifactsProcessed") {

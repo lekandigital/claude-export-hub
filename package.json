@@ -1,0 +1,13 @@
+{
+  "name": "claude-export-hub",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Chrome extension for exporting Claude.ai conversations",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:fixtures": "node --test test/fixtures.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}

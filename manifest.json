@@ -26,6 +26,7 @@
       ],
       "js": [
         "banner.js",
+        "lib/export-core.js",
         "content.js"
       ]
     }

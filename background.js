@@ -1,5 +1,32 @@
 // background.js
-importScripts("jszip.min.js");
+importScripts("jszip.min.js", "lib/export-core.js");
+
+const {
+  normalizeChatPayload,
+  isStorableChatPayload,
+  isValidChatPayload,
+  getActiveBranchMessages,
+  getMostRecentRootMessage,
+  getMessageText,
+  stripArtifactsFromText,
+  getAttachmentExcerpts,
+  collectCategorizedItemsFromPayload,
+  collectThinkingFromPayload,
+  thinkingDedupeKey,
+  extractArtifacts,
+  inferPastedTitle,
+  getUniqueFileName,
+  buildExportDiagnostics,
+  logExportDiagnostics,
+} = CadExportCore;
+
+function sanitizeFilename(name) {
+  const sanitized = (name || "claude-artifacts")
+    .replace(/[/\\?%*:|"<>]/g, "_")
+    .replace(/[\x00-\x1f]/g, "")
+    .trim();
+  return sanitized || "claude-artifacts";
+}
 
 const LOG_PREFIX = "[Claude Export Hub]";
 const CHAT_URL_PATTERN = /^https:\/\/claude\.ai\/chat\/[^/]+/;
@@ -11,6 +38,10 @@ const ORG_API_URLS = [
 const EXPORT_JOB_KEY = "exportJob";
 const CHAT_FETCH_DELAY_MS = 150;
 const LIST_PAGE_SIZE = 50;
+const DOM_SCRAPE_TIMEOUT_MS = 25000;
+const DOM_SCRAPE_POLL_MS = 500;
+const DOM_SCRAPE_RENDER_DELAY_MS = 1500;
+const DOM_SCRAPE_EXPAND_DELAY_MS = 600;
 
 function collectChatOrgIds(data) {
   const orgs = Array.isArray(data)
@@ -147,7 +178,7 @@ async function ensureContentScript(tabId) {
 
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ["banner.js", "content.js"],
+    files: ["banner.js", "lib/export-core.js", "content.js"],
   });
   await delay(100);
 
@@ -175,14 +206,6 @@ function broadcastExportProgress(job) {
   chrome.runtime
     .sendMessage({ action: "exportProgress", job })
     .catch(() => {});
-}
-
-function sanitizeFilename(name) {
-  const sanitized = (name || "claude-artifacts")
-    .replace(/[/\\?%*:|"<>]/g, "_")
-    .replace(/[\x00-\x1f]/g, "")
-    .trim();
-  return sanitized || "claude-artifacts";
 }
 
 function getStoragePayload(uuid) {
@@ -239,17 +262,10 @@ function setExportJob(job) {
   });
 }
 
-function isStorableChatPayload(resp) {
-  return !!(resp && resp.uuid && Array.isArray(resp.chat_messages));
-}
-
-function isValidChatPayload(resp) {
-  return isStorableChatPayload(resp) && resp.chat_messages.length > 0;
-}
-
 async function storeChatPayload(resp) {
+  const payload = normalizeChatPayload(resp) || resp;
   await new Promise((resolve) => {
-    chrome.storage.local.set({ [`chat_${resp.uuid}`]: resp }, resolve);
+    chrome.storage.local.set({ [`chat_${payload.uuid}`]: payload }, resolve);
   });
 }
 
@@ -491,108 +507,10 @@ function showExportNotification(message) {
   );
 }
 
-function getMostRecentRootMessage(payload) {
-  const rootMessages = payload.chat_messages.filter(
-    (message) =>
-      message.parent_message_uuid === "00000000-0000-4000-8000-000000000000",
-  );
-  if (rootMessages.length === 0) {
-    return null;
-  }
-  return rootMessages.reduce((latest, current) => {
-    return new Date(current.updated_at) > new Date(latest.updated_at)
-      ? current
-      : latest;
-  });
-}
-
 function buildChatFolderPrefix(payload) {
-  const shortId = payload.uuid.slice(0, 8);
-  return `${sanitizeFilename(payload.name || "chat")}_${shortId}/`;
-}
-
-function getActiveBranchMessages(payload) {
-  const messages = payload.chat_messages || [];
-  const byUuid = new Map(messages.map((m) => [m.uuid, m]));
-  const nilUuid = "00000000-0000-4000-8000-000000000000";
-  const leafUuid = payload.current_leaf_message_uuid;
-
-  if (!leafUuid || !byUuid.has(leafUuid)) {
-    const root = getMostRecentRootMessage(payload);
-    if (!root) {
-      return [];
-    }
-    const branch = [];
-    let node = root;
-    while (node) {
-      branch.push(node);
-      const children = messages
-        .filter((m) => m.parent_message_uuid === node.uuid)
-        .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-      node = children.length ? children[children.length - 1] : null;
-    }
-    return branch;
-  }
-
-  const branch = [];
-  let current = byUuid.get(leafUuid);
-  while (current) {
-    branch.push(current);
-    const parentUuid = current.parent_message_uuid;
-    if (!parentUuid || parentUuid === nilUuid) {
-      break;
-    }
-    current = byUuid.get(parentUuid);
-    if (!current) {
-      break;
-    }
-  }
-  return branch.reverse();
-}
-
-function stripArtifactsFromText(text) {
-  return text
-    .replace(/<antArtifact[^>]*>[\s\S]*?<\/antArtifact>/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function getAttachmentExcerpts(message) {
-  const excerpts = [];
-  const sources = [
-    ...(message.attachments || []),
-    ...(message.files || []),
-    ...(message.files_v2 || []),
-  ];
-  for (const att of sources) {
-    const content = att.extracted_content || att.content;
-    if (typeof content === "string" && content.trim()) {
-      const name = att.file_name || att.filename || att.name || "attachment";
-      excerpts.push({ name, content: content.trim() });
-    }
-  }
-  if (Array.isArray(message.content)) {
-    for (const block of message.content) {
-      const blockBody =
-        block.text ||
-        block.content ||
-        block.source?.data ||
-        block.document?.content;
-      if (
-        block.type &&
-        block.type !== "text" &&
-        block.type !== "thinking" &&
-        typeof blockBody === "string" &&
-        blockBody.trim().length > 80
-      ) {
-        excerpts.push({
-          name: block.title || block.name || block.type,
-          content: blockBody.trim(),
-        });
-      }
-    }
-  }
-  return excerpts;
+  const normalized = normalizeChatPayload(payload) || payload;
+  const shortId = normalized.uuid.slice(0, 8);
+  return `${sanitizeFilename(normalized.name || "chat")}_${shortId}/`;
 }
 
 function buildChatMarkdown(payload) {
@@ -623,147 +541,17 @@ function buildChatMarkdown(payload) {
   return `${lines.join("\n").trim()}\n`;
 }
 
-function collectCategorizedItemsFromPayload(payload) {
-  const messages = getActiveBranchMessages(payload);
-  const artifacts = [];
-  const pasted = [];
-  const seenArtifacts = new Set();
-  const seenPasted = new Set();
-
-  function addArtifact(item, messageIndex) {
-    const key = `${item.title}::${item.content.slice(0, 120)}`;
-    if (seenArtifacts.has(key)) {
-      return;
-    }
-    seenArtifacts.add(key);
-    artifacts.push({ ...item, messageIndex });
-  }
-
-  function addPasted(item, messageIndex) {
-    const key = `${item.title}::${item.content.slice(0, 120)}`;
-    if (seenPasted.has(key)) {
-      return;
-    }
-    seenPasted.add(key);
-    pasted.push({ ...item, messageIndex });
-  }
-
-  for (const message of messages) {
-    const text = getMessageText(message);
-    const index = message.index ?? 0;
-
-    for (const artifact of extractArtifacts(text)) {
-      addArtifact(artifact, index);
-    }
-
-    if (Array.isArray(message.content)) {
-      for (const block of message.content) {
-        if (block.type === "text" && block.text) {
-          for (const artifact of extractArtifacts(block.text)) {
-            addArtifact(artifact, index);
-          }
-        }
-      }
-    }
-
-    if (message.sender === "human" && text.trim().length > 80) {
-      addPasted(
-        {
-          title: inferPastedTitle(text, "human"),
-          language: "markdown",
-          content: text.trim(),
-        },
-        index,
-      );
-    }
-  }
-
-  return { artifacts, pasted };
-}
-
-function collectThinkingItems(message) {
-  const items = [];
-
-  if (!Array.isArray(message.content)) {
-    return items;
-  }
-
-  for (const [index, block] of message.content.entries()) {
-    if (block.type === "thinking") {
-      const content =
-        block.thinking ||
-        block.text ||
-        block.content ||
-        block.summary ||
-        "";
-
-      if (typeof content === "string" && content.trim()) {
-        items.push({
-          source: "payload",
-          kind: "thinking",
-          blockIndex: index,
-          title: block.title || block.summary_title || "Visible thinking",
-          content: content.trim(),
-          signature: block.signature || null,
-        });
-      } else if (block.display === "omitted") {
-        items.push({
-          source: "payload",
-          kind: "thinking",
-          blockIndex: index,
-          title: "Visible thinking",
-          content: "[Thinking omitted]",
-        });
-      }
-    }
-
-    if (block.type === "redacted_thinking") {
-      items.push({
-        source: "payload",
-        kind: "redacted_thinking",
-        blockIndex: index,
-        title: "Redacted thinking",
-        content:
-          "[Redacted thinking block present. The readable content is not available.]",
-        redacted: true,
-        dataLength: typeof block.data === "string" ? block.data.length : 0,
-      });
-    }
-  }
-
-  return items;
-}
-
-function collectThinkingFromPayload(payload) {
-  const items = [];
-  for (const message of getActiveBranchMessages(payload)) {
-    if (message.sender !== "assistant") {
-      continue;
-    }
-    for (const item of collectThinkingItems(message)) {
-      items.push({
-        ...item,
-        messageUuid: message.uuid,
-        messageIndex: message.index,
-      });
-    }
-  }
-  return items;
-}
-
-function thinkingDedupeKey(item) {
-  return `${item.kind || "thinking"}:${(item.content || "").slice(0, 160)}`;
-}
-
 function domBlockToThinkingItem(block, capturedAt) {
   const partial = block.streaming === true;
   return {
     source: "dom",
-    kind: "thinking",
-    title: block.title || "Visible thinking",
+    kind: block.kind || "status",
+    title: block.title || "Visible status",
     content: block.content || "",
     partial,
     streaming: partial,
+    expanded: block.expanded,
+    collapsed: block.collapsed,
     turnIndex: block.turnIndex,
     blockIndex: block.blockIndex,
     capturedAt:
@@ -787,6 +575,150 @@ async function getVisibleThinkingForChat(uuid) {
   };
 }
 
+function getUuidFromTabUrl(url) {
+  return url?.match(/\/chat\/([0-9a-f-]{36})/i)?.[1] || null;
+}
+
+function sendTabMessage(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ error: chrome.runtime.lastError.message });
+        return;
+      }
+      resolve(response || {});
+    });
+  });
+}
+
+function waitForTabChatPage(tabId, uuid, timeoutMs = DOM_SCRAPE_TIMEOUT_MS) {
+  const chatPattern = new RegExp(
+    `/chat/${uuid.replace(/-/g, "\\-")}`,
+    "i",
+  );
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    function finish(fn, value) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      fn(value);
+    }
+
+    const timeout = setTimeout(() => {
+      finish(reject, new Error(`Timed out waiting for chat page ${uuid}`));
+    }, timeoutMs);
+
+    function onUpdated(updatedTabId, changeInfo, tab) {
+      if (updatedTabId !== tabId || changeInfo.status !== "complete") {
+        return;
+      }
+      if (chatPattern.test(tab.url || "")) {
+        finish(resolve, tab);
+      }
+    }
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+
+    chrome.tabs.get(tabId).then((tab) => {
+      if (chatPattern.test(tab.url || "") && tab.status === "complete") {
+        finish(resolve, tab);
+      }
+    });
+  });
+}
+
+async function waitForChatDomReady(tabId, uuid) {
+  const deadline = Date.now() + DOM_SCRAPE_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    if (jobCancelRequested) {
+      return { ready: false, cancelled: true };
+    }
+
+    const probe = await sendTabMessage(tabId, {
+      action: "probeChatDom",
+      uuid,
+    });
+
+    if (probe.error) {
+      await ensureContentScript(tabId);
+      await delay(DOM_SCRAPE_POLL_MS);
+      continue;
+    }
+
+    if (probe.ready) {
+      return probe;
+    }
+
+    await delay(DOM_SCRAPE_POLL_MS);
+  }
+
+  return { ready: false, timedOut: true };
+}
+
+async function visitChatAndScrapeDomThinking(tabId, uuid) {
+  if (!tabId || !uuid) {
+    return [];
+  }
+
+  const chatUrl = `https://claude.ai/chat/${uuid}`;
+  const tab = await chrome.tabs.get(tabId);
+  const alreadyOnChat = getUuidFromTabUrl(tab.url) === uuid;
+
+  if (!alreadyOnChat) {
+    console.log(LOG_PREFIX, "visiting chat for DOM scrape:", uuid);
+    await chrome.tabs.update(tabId, { url: chatUrl });
+    await waitForTabChatPage(tabId, uuid);
+  }
+
+  await ensureContentScript(tabId);
+  await delay(DOM_SCRAPE_RENDER_DELAY_MS);
+
+  const probe = await waitForChatDomReady(tabId, uuid);
+  console.log(LOG_PREFIX, "DOM probe for", uuid, probe);
+
+  const scrapeResult = await sendTabMessage(tabId, {
+    action: "scrapeVisibleThinking",
+    uuid,
+    expandPanels: true,
+    expandDelayMs: DOM_SCRAPE_EXPAND_DELAY_MS,
+  });
+
+  if (scrapeResult.error) {
+    console.warn(
+      LOG_PREFIX,
+      "DOM scrape message failed for",
+      uuid,
+      scrapeResult.error,
+    );
+    return [];
+  }
+
+  const blocks = scrapeResult.blocks || [];
+  if (blocks.length) {
+    await handleCacheVisibleThinking({
+      uuid,
+      blocks,
+      updatedAt: Date.now(),
+    });
+    console.log(
+      LOG_PREFIX,
+      "cached",
+      blocks.length,
+      "status/thinking blocks from DOM visit for",
+      uuid,
+    );
+  }
+
+  return blocks;
+}
+
 async function getVisibleThinkingFromTab(tabId, uuid) {
   if (!tabId || !uuid) {
     return [];
@@ -796,11 +728,10 @@ async function getVisibleThinkingFromTab(tabId, uuid) {
     if (!CHAT_URL_PATTERN.test(tab.url || "")) {
       return [];
     }
-    const tabUuid = tab.url.match(/\/chat\/([0-9a-f-]{36})/i)?.[1];
-    if (tabUuid !== uuid) {
+    if (getUuidFromTabUrl(tab.url) !== uuid) {
       return [];
     }
-    const response = await chrome.tabs.sendMessage(tabId, {
+    const response = await sendTabMessage(tabId, {
       action: "getVisibleThinking",
       uuid,
     });
@@ -810,9 +741,23 @@ async function getVisibleThinkingFromTab(tabId, uuid) {
   }
 }
 
-async function collectThinkingForChat(payload, tabId, uuid) {
+async function collectThinkingForChat(payload, tabId, uuid, options = {}) {
+  const { visitForDom = false } = options;
   const byKey = new Map();
   const chatUuid = uuid || payload.uuid;
+
+  if (visitForDom && tabId && chatUuid) {
+    try {
+      await visitChatAndScrapeDomThinking(tabId, chatUuid);
+    } catch (error) {
+      console.warn(
+        LOG_PREFIX,
+        "DOM visit scrape failed for",
+        chatUuid,
+        error.message,
+      );
+    }
+  }
 
   for (const item of collectThinkingFromPayload(payload)) {
     byKey.set(thinkingDedupeKey(item), item);
@@ -879,6 +824,12 @@ function writeThinkingToZip(zip, folderPrefix, thinkingItems) {
       `partial: ${item.partial ? "true" : "false"}`,
       `streaming: ${item.streaming ? "true" : "false"}`,
     ];
+    if (item.expanded != null) {
+      frontmatter.push(`expanded: ${item.expanded ? "true" : "false"}`);
+    }
+    if (item.collapsed != null) {
+      frontmatter.push(`collapsed: ${item.collapsed ? "true" : "false"}`);
+    }
     if (item.signature) {
       frontmatter.push(`signature: ${item.signature}`);
     }
@@ -916,6 +867,36 @@ function writeThinkingToZip(zip, folderPrefix, thinkingItems) {
   return count;
 }
 
+function writeFileCategoryToZip(zip, folderPrefix, subfolder, items) {
+  if (!items.length) {
+    return { fileCount: 0, indexEntries: [] };
+  }
+
+  let fileCount = 0;
+  const usedNames = new Set();
+  const indexEntries = [];
+
+  for (const item of items) {
+    const fileName = getUniqueFileName(
+      item.title,
+      item.language,
+      item.messageIndex ?? 0,
+      usedNames,
+    );
+    zip.file(`${folderPrefix}${subfolder}/${fileName}`, item.content);
+    fileCount++;
+    indexEntries.push({
+      path: `${subfolder}/${fileName}`,
+      title: item.title,
+      source: item.source || null,
+      category: item.category || subfolder,
+      messageIndex: item.messageIndex ?? null,
+    });
+  }
+
+  return { fileCount, indexEntries };
+}
+
 function writeStructuredChatToZip(
   zip,
   payload,
@@ -925,24 +906,32 @@ function writeStructuredChatToZip(
 ) {
   let fileCount = 0;
   const skipped = [];
-  const chatName = payload.name || "Untitled";
-  const messages = getActiveBranchMessages(payload);
-  const { artifacts, pasted } = collectCategorizedItemsFromPayload(payload);
+  const normalized = normalizeChatPayload(payload) || payload;
+  const chatName = normalized.name || "Untitled";
+  const messages = getActiveBranchMessages(normalized);
+  const { artifacts, attachments, presentedFiles, generatedFiles, pasted } =
+    collectCategorizedItemsFromPayload(normalized);
+  const allFileItems = [
+    ...artifacts,
+    ...attachments,
+    ...presentedFiles,
+    ...generatedFiles,
+  ];
 
   if (exportIncludes.transcript) {
     if (messages.length === 0) {
       skipped.push(
         createCategorySkipRecord(
-          payload,
+          normalized,
           "transcript",
           "No messages on active branch",
         ),
       );
     } else {
-      const markdown = buildChatMarkdown(payload);
+      const markdown = buildChatMarkdown(normalized);
       if (isTrivialTranscript(markdown, chatName)) {
         skipped.push(
-          createCategorySkipRecord(payload, "transcript", "Transcript content is empty"),
+          createCategorySkipRecord(normalized, "transcript", "Transcript content is empty"),
         );
       } else {
         zip.file(`${folderPrefix}chat.md`, markdown);
@@ -952,22 +941,39 @@ function writeStructuredChatToZip(
   }
 
   if (exportIncludes.artifacts) {
-    if (artifacts.length === 0) {
-      skipped.push(
-        createCategorySkipRecord(payload, "artifacts", "No artifacts found"),
+    const filesIndex = [];
+    const categoryWrites = [
+      ["artifacts", artifacts],
+      ["attachments", attachments],
+      ["presented-files", presentedFiles],
+      ["generated-files", generatedFiles],
+    ];
+
+    for (const [subfolder, items] of categoryWrites) {
+      const result = writeFileCategoryToZip(
+        zip,
+        folderPrefix,
+        subfolder,
+        items,
       );
-    } else {
-      const usedNames = new Set();
-      for (const item of artifacts) {
-        const fileName = getUniqueFileName(
-          item.title,
-          item.language,
-          item.messageIndex,
-          usedNames,
-        );
-        zip.file(`${folderPrefix}artifacts/${fileName}`, item.content);
-        fileCount++;
-      }
+      fileCount += result.fileCount;
+      filesIndex.push(...result.indexEntries);
+    }
+
+    if (allFileItems.length === 0) {
+      skipped.push(
+        createCategorySkipRecord(
+          normalized,
+          "artifacts",
+          "No artifacts or exportable files found",
+        ),
+      );
+    } else if (filesIndex.length) {
+      zip.file(
+        `${folderPrefix}files_index.json`,
+        JSON.stringify(filesIndex, null, 2),
+      );
+      fileCount++;
     }
   }
 
@@ -975,7 +981,7 @@ function writeStructuredChatToZip(
     if (pasted.length === 0) {
       skipped.push(
         createCategorySkipRecord(
-          payload,
+          normalized,
           "pasted",
           "No pasted messages over 80 characters",
         ),
@@ -999,9 +1005,9 @@ function writeStructuredChatToZip(
     if (thinkingItems.length === 0) {
       skipped.push(
         createCategorySkipRecord(
-          payload,
+          normalized,
           "thinking",
-          "No visible thinking found",
+          "No visible thinking/status panels found",
         ),
       );
     } else {
@@ -1021,17 +1027,32 @@ function writeStructuredChatToZip(
 }
 
 async function addChatToZip(zip, payload, options) {
-  const { exportIncludes, tabId, uuid, tryRawSupplement = false } = options;
-  const folderPrefix = buildChatFolderPrefix(payload);
+  const {
+    exportIncludes,
+    tabId,
+    uuid,
+    tryRawSupplement = false,
+    visitForDom = false,
+  } = options;
+  const normalized = normalizeChatPayload(payload) || payload;
+  const folderPrefix = buildChatFolderPrefix(normalized);
 
   let thinkingItems = [];
   if (exportIncludes.thinking) {
-    thinkingItems = await collectThinkingForChat(payload, tabId, uuid);
+    thinkingItems = await collectThinkingForChat(normalized, tabId, uuid, {
+      visitForDom,
+    });
   }
+
+  const cachedDom = await getVisibleThinkingForChat(uuid || normalized.uuid);
+  logExportDiagnostics(normalized, {
+    domBlocks: cachedDom.blocks || thinkingItems.filter((item) => item.source === "dom"),
+    debug: true,
+  });
 
   let result = writeStructuredChatToZip(
     zip,
-    payload,
+    normalized,
     exportIncludes,
     folderPrefix,
     thinkingItems,
@@ -1047,6 +1068,7 @@ async function addChatToZip(zip, payload, options) {
           rawSupplement.payload,
           tabId,
           uuid,
+          { visitForDom: false },
         );
       }
       result = writeStructuredChatToZip(
@@ -1177,11 +1199,31 @@ async function runExportJob(request, tabId) {
   await setExportJob(job);
   broadcastExportProgress(job);
 
+  let originalTabUrl = null;
+  let shouldRestoreTab = false;
+
   try {
     const { uuids, nameByUuid } = await resolveUuidList(request, tabId);
+    const scope = request.scope || "current";
+    const visitForDom =
+      exportIncludes.thinking && tabId && scope !== "current";
+
+    if (visitForDom) {
+      shouldRestoreTab = true;
+      try {
+        const startTab = await chrome.tabs.get(tabId);
+        originalTabUrl = startTab.url || null;
+      } catch {
+        originalTabUrl = null;
+      }
+    }
 
     await updateJobProgress(
-      { phase: "fetching", total: uuids.length, current: 0 },
+      {
+        phase: visitForDom ? "visiting chats" : "fetching",
+        total: uuids.length,
+        current: 0,
+      },
       tabId,
     );
 
@@ -1227,6 +1269,7 @@ async function runExportJob(request, tabId) {
         tabId,
         uuid,
         tryRawSupplement: true,
+        visitForDom,
       });
 
       skipped.push(...chatSkips);
@@ -1312,7 +1355,6 @@ async function runExportJob(request, tabId) {
       zip.file("export-skipped.txt", formatSkipReportText(chatSkips));
     }
 
-    const scope = request.scope || "current";
     let filename;
     if (scope === "current" && uuids.length === 1) {
       const cached = await getStoragePayload(uuids[0]);
@@ -1376,6 +1418,19 @@ async function runExportJob(request, tabId) {
       { silent: true },
     );
     throw error;
+  } finally {
+    if (shouldRestoreTab && originalTabUrl && tabId) {
+      try {
+        await chrome.tabs.update(tabId, { url: originalTabUrl });
+        console.log(LOG_PREFIX, "restored Claude tab URL after bulk export");
+      } catch (error) {
+        console.warn(
+          LOG_PREFIX,
+          "Could not restore Claude tab URL:",
+          error.message,
+        );
+      }
+    }
   }
 }
 
@@ -1433,94 +1488,6 @@ async function handleListConversations(_request, sender) {
   }
 
   return { conversations: result.conversations };
-}
-
-function getMessageText(message) {
-  if (typeof message.text === "string" && message.text.trim()) {
-    return message.text;
-  }
-  if (Array.isArray(message.content)) {
-    return message.content
-      .filter((block) => block.type === "text" && block.text)
-      .map((block) => block.text)
-      .join("\n\n");
-  }
-  return "";
-}
-
-function inferPastedTitle(text, sender) {
-  const firstLine = text.trim().split("\n")[0].slice(0, 60);
-  const cleaned = firstLine.replace(/[^\w\-._]+/g, "_").replace(/^_+|_+$/g, "");
-  const prefix = sender === "human" ? "pasted" : "content";
-  return cleaned ? `${prefix}_${cleaned}` : `${prefix}_message`;
-}
-
-function extractArtifacts(text) {
-  const artifactRegex = /<antArtifact[^>]*>([\s\S]*?)<\/antArtifact>/g;
-  const artifacts = [];
-  let match;
-
-  while ((match = artifactRegex.exec(text)) !== null) {
-    const fullTag = match[0];
-    const content = match[1];
-
-    const titleMatch = fullTag.match(/title="([^"]*)/);
-    const languageMatch = fullTag.match(/language="([^"]*)/);
-
-    artifacts.push({
-      title: titleMatch ? titleMatch[1] : "Untitled",
-      language: languageMatch ? languageMatch[1] : "txt",
-      content: content.trim(),
-    });
-  }
-
-  return artifacts;
-}
-
-function getUniqueFileName(title, language, messageIndex, usedNames) {
-  const baseName = title.replace(/[^\w\-._]+/g, "_");
-  const extension = getFileExtension(language);
-
-  let fileName = `${messageIndex + 1}_${baseName}${extension}`;
-  if (usedNames.has(fileName)) {
-    let suffixCount = 1;
-    while (usedNames.has(fileName)) {
-      const suffix = `_${"*".repeat(suffixCount)}`;
-      fileName = `${messageIndex + 1}_${baseName}${suffix}${extension}`;
-      suffixCount++;
-    }
-  }
-
-  usedNames.add(fileName);
-  return fileName;
-}
-
-function getFileExtension(language) {
-  const languageToExt = {
-    javascript: ".js",
-    html: ".html",
-    css: ".css",
-    python: ".py",
-    java: ".java",
-    c: ".c",
-    cpp: ".cpp",
-    ruby: ".rb",
-    php: ".php",
-    swift: ".swift",
-    go: ".go",
-    rust: ".rs",
-    typescript: ".ts",
-    shell: ".sh",
-    sql: ".sql",
-    kotlin: ".kt",
-    scala: ".scala",
-    r: ".r",
-    matlab: ".m",
-    markdown: ".md",
-    md: ".md",
-    txt: ".txt",
-  };
-  return languageToExt[language.toLowerCase()] || ".txt";
 }
 
 chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
@@ -1650,7 +1617,7 @@ async function fetchPayloadFromUrl(url, requestHeaders, uuid) {
   if (!isStorableChatPayload(resp)) {
     return { payload: null, error: `unusable payload from ${url}` };
   }
-  return { payload: resp };
+  return { payload: normalizeChatPayload(resp) };
 }
 
 async function discoverOrganizationIds() {
@@ -2009,12 +1976,13 @@ async function fetchPayloadViaPageEventBridge(tabId, uuid, options = {}) {
                   continue;
                 }
                 const json = await response.json();
-                if (json?.uuid && Array.isArray(json?.chat_messages)) {
+                const normalized = CadExportCore.normalizeChatPayload(json);
+                if (normalized) {
                   dispatch({
-                    payload: json,
+                    payload: normalized,
                     rawUrl: absoluteUrl,
                     orgCount: orgIds.length,
-                    messageCount: json.chat_messages.length,
+                    messageCount: normalized.chat_messages.length,
                   });
                   return;
                 }
