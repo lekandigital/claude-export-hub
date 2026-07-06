@@ -1109,6 +1109,285 @@ async function downloadZip(zip, filename) {
   });
 }
 
+// ── Combined context file generation ────────────────────────────────
+
+const COMBINED_FILENAME = "_combined.txt";
+const COMBINED_DEDUPED_FILENAME = "_combined_deduped.txt";
+const COMBINED_FILENAMES = new Set([COMBINED_FILENAME, COMBINED_DEDUPED_FILENAME]);
+const COMBINED_SEPARATOR = "─".repeat(52);
+const COMBINED_TOP = "┌" + "─".repeat(52);
+const COMBINED_BOT = "└" + "─".repeat(52);
+
+function collectZipTextFiles(zip, folderPath) {
+  const prefix = folderPath ? (folderPath.endsWith("/") ? folderPath : folderPath + "/") : "";
+  const files = [];
+
+  zip.forEach((relativePath, entry) => {
+    if (entry.dir) {
+      return;
+    }
+    if (!relativePath.startsWith(prefix)) {
+      return;
+    }
+    const name = relativePath.slice(prefix.length);
+    if (COMBINED_FILENAMES.has(name.split("/").pop())) {
+      return;
+    }
+    if (name.endsWith(".json")) {
+      return;
+    }
+    files.push({ path: relativePath, localPath: name });
+  });
+
+  files.sort((a, b) => a.localPath.localeCompare(b.localPath));
+  return files;
+}
+
+function getZipSubfolders(zip, folderPath) {
+  const prefix = folderPath ? (folderPath.endsWith("/") ? folderPath : folderPath + "/") : "";
+  const folders = new Set();
+
+  zip.forEach((relativePath, entry) => {
+    if (!relativePath.startsWith(prefix)) {
+      return;
+    }
+    const rest = relativePath.slice(prefix.length);
+    const slashIndex = rest.indexOf("/");
+    if (slashIndex > 0) {
+      folders.add(rest.slice(0, slashIndex));
+    }
+  });
+
+  return [...folders].sort();
+}
+
+function groupFilesByFolder(files) {
+  const groups = new Map();
+  for (const file of files) {
+    const slashIndex = file.localPath.indexOf("/");
+    const folder = slashIndex > 0 ? file.localPath.slice(0, slashIndex) : "";
+    if (!groups.has(folder)) {
+      groups.set(folder, []);
+    }
+    groups.get(folder).push(file);
+  }
+  return groups;
+}
+
+async function buildCombinedText(zip, folderPath) {
+  const files = collectZipTextFiles(zip, folderPath);
+  if (files.length === 0) {
+    return null;
+  }
+
+  const lines = [];
+  const grouped = groupFilesByFolder(files);
+  let isFirst = true;
+
+  for (const [folder, folderFiles] of grouped) {
+    if (folder) {
+      if (!isFirst) {
+        lines.push("", "");
+      }
+      lines.push(COMBINED_TOP);
+      lines.push(`│ 📁 ${folder}/`);
+      lines.push(COMBINED_BOT);
+      lines.push("");
+    }
+
+    for (const file of folderFiles) {
+      if (!isFirst && !folder) {
+        lines.push("", COMBINED_SEPARATOR, "");
+      }
+      isFirst = false;
+
+      const displayName = file.localPath;
+      lines.push(`┌ 📄 ${displayName}`);
+      lines.push(COMBINED_BOT);
+
+      try {
+        const content = await zip.file(file.path).async("string");
+        if (content.trim()) {
+          lines.push(content.trimEnd());
+        }
+      } catch {
+        lines.push("[Could not read file]");
+      }
+
+      lines.push("");
+    }
+  }
+
+  const prefix = folderPath ? folderPath.replace(/\/$/, "").split("/").pop() : "export";
+  lines.push(COMBINED_SEPARATOR);
+  lines.push(`${files.length} file${files.length === 1 ? "" : "s"} combined from ${prefix}/`);
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+function normParagraph(text) {
+  return text.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function splitParagraphs(content) {
+  if (!content) {
+    return [];
+  }
+  return content.split(/\n\s*\n/).filter((block) => block.trim());
+}
+
+function formatPid(pid, width) {
+  return `P${String(pid).padStart(width, "0")}`;
+}
+
+async function buildCombinedDeduped(zip, folderPath) {
+  const files = collectZipTextFiles(zip, folderPath);
+  if (files.length === 0) {
+    return null;
+  }
+
+  const paragraphs = [];
+  let pid = 1;
+
+  for (const file of files) {
+    let content;
+    try {
+      content = await zip.file(file.path).async("string");
+    } catch {
+      content = "";
+    }
+    for (const block of splitParagraphs(content)) {
+      paragraphs.push({
+        pid: pid++,
+        sourceFile: file.localPath,
+        text: block,
+        normKey: normParagraph(block),
+      });
+    }
+  }
+
+  if (paragraphs.length === 0) {
+    return null;
+  }
+
+  const width = Math.max(4, String(paragraphs.length).length);
+  const seen = new Map();
+  const canonicalFor = new Map();
+
+  for (const para of paragraphs) {
+    if (!para.normKey) {
+      canonicalFor.set(para.pid, para.pid);
+      continue;
+    }
+    if (!seen.has(para.normKey)) {
+      seen.set(para.normKey, para.pid);
+      canonicalFor.set(para.pid, para.pid);
+    } else {
+      canonicalFor.set(para.pid, seen.get(para.normKey));
+    }
+  }
+
+  const lines = [
+    "# Combined & Deduplicated Context",
+    `# [P${"#".repeat(width)}] IDs identify each paragraph.`,
+    `# "→ P${"#".repeat(width)}" means duplicate removed — see referenced paragraph for full text.`,
+    "",
+  ];
+
+  const paraByFile = new Map();
+  for (const para of paragraphs) {
+    if (!paraByFile.has(para.sourceFile)) {
+      paraByFile.set(para.sourceFile, []);
+    }
+    paraByFile.get(para.sourceFile).push(para);
+  }
+
+  for (const file of files) {
+    lines.push(`┌ 📄 ${file.localPath}`);
+    lines.push(COMBINED_BOT);
+    lines.push("");
+
+    const fileParagraphs = paraByFile.get(file.localPath) || [];
+    for (const para of fileParagraphs) {
+      const keptPid = canonicalFor.get(para.pid);
+      if (keptPid === para.pid) {
+        lines.push(`[${formatPid(para.pid, width)}]`);
+        if (para.text) {
+          lines.push(para.text);
+        }
+      } else {
+        lines.push(`[${formatPid(para.pid, width)}]`);
+        lines.push(`→ ${formatPid(keptPid, width)}`);
+      }
+      lines.push("");
+    }
+  }
+
+  const uniqueNorm = new Set(
+    paragraphs.filter((p) => p.normKey).map((p) => p.normKey),
+  ).size;
+  const removed = paragraphs.length - uniqueNorm;
+
+  lines.push(COMBINED_SEPARATOR);
+  lines.push("STATS");
+  lines.push(`  files: ${files.length}`);
+  lines.push(`  paragraphs_total: ${paragraphs.length}`);
+  lines.push(`  paragraphs_unique: ${uniqueNorm}`);
+  lines.push(`  duplicates_removed: ${removed}`);
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+async function writeCombinedFilesForFolder(zip, folderPath) {
+  const prefix = folderPath
+    ? folderPath.endsWith("/") ? folderPath : folderPath + "/"
+    : "";
+
+  const textFiles = collectZipTextFiles(zip, folderPath);
+  if (textFiles.length <= 1) {
+    return 0;
+  }
+
+  let count = 0;
+
+  const combined = await buildCombinedText(zip, folderPath);
+  if (combined) {
+    zip.file(`${prefix}${COMBINED_FILENAME}`, combined);
+    count++;
+  }
+
+  const deduped = await buildCombinedDeduped(zip, folderPath);
+  if (deduped) {
+    zip.file(`${prefix}${COMBINED_DEDUPED_FILENAME}`, deduped);
+    count++;
+  }
+
+  return count;
+}
+
+async function writeCombinedFilesRecursive(zip) {
+  const topFolders = getZipSubfolders(zip, "");
+  let totalCombinedFiles = 0;
+
+  for (const topFolder of topFolders) {
+    const subfolders = getZipSubfolders(zip, topFolder);
+    for (const subfolder of subfolders) {
+      const subPath = `${topFolder}/${subfolder}`;
+      totalCombinedFiles += await writeCombinedFilesForFolder(zip, subPath);
+    }
+
+    totalCombinedFiles += await writeCombinedFilesForFolder(zip, topFolder);
+  }
+
+  totalCombinedFiles += await writeCombinedFilesForFolder(zip, "");
+
+  return totalCombinedFiles;
+}
+
+// ── End combined context file generation ────────────────────────────
+
 async function updateJobProgress(partial, tabId) {
   const current = (await getExportJob()) || {};
   const job = { ...current, ...partial };
@@ -1349,6 +1628,9 @@ async function runExportJob(request, tabId) {
     }
 
     await updateJobProgress({ phase: "zipping" }, tabId);
+
+    const combinedCount = await writeCombinedFilesRecursive(zip);
+    totalFiles += combinedCount;
 
     const chatSkips = getChatLevelSkips(skipped);
     if (chatSkips.length > 0) {

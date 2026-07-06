@@ -2,6 +2,10 @@
 
 Chrome extension for exporting Claude.ai conversations — transcripts, artifacts, pasted content, attachment excerpts, and visible thinking/status panels (toggleable per export) — as organized ZIP archives. All processing runs locally in your browser.
 
+## ⚠ Maintenance notice
+
+Claude Export Hub depends on the structure of Claude's web interface and API responses, both of which Anthropic changes frequently and without notice. **The extension requires ongoing updates to maintain full functionality.** If exports start returning empty results or missing content categories, check for an updated version of the extension. DOM selectors for status panels, API response shapes, and conversation payload structures are all subject to change.
+
 ## What it does
 
 Claude Export Hub fetches conversation data from Claude's own API using your existing browser session, then packages selected content into downloadable ZIP files. No third-party servers are involved.
@@ -43,16 +47,26 @@ Each exported chat gets its own folder inside the ZIP:
 
 ```
 Chat_Title_a1b2c3d4/
-  chat.md               # when Transcript is checked
-  artifacts/            # <antArtifact> and artifact-like content blocks
-  attachments/          # uploaded attachment excerpts with usable text
-  presented-files/      # presented file payloads (for example files_v2)
-  generated-files/      # generated/tool output files
-  files_index.json      # manifest of exported files across the folders above
-  pasted/               # when Pasted is checked
-  thinking/             # when Visible thinking is checked
-  skipped.txt           # optional notes when a category had nothing to export
+  _combined.txt           # all files in this chat merged into one context file
+  _combined_deduped.txt   # same, with numbered paragraphs and duplicates removed
+  chat.md                 # when Transcript is checked
+  artifacts/              # <antArtifact> and artifact-like content blocks
+    _combined.txt          # artifacts-only combined (when 2+ files)
+    _combined_deduped.txt
+  attachments/            # uploaded attachment excerpts with usable text
+  presented-files/        # presented file payloads (for example files_v2)
+  generated-files/        # generated/tool output files
+  files_index.json        # manifest of exported files across the folders above
+  pasted/                 # when Pasted is checked
+  thinking/               # when Visible thinking is checked
+    _combined.txt          # thinking-only combined (when 2+ files)
+    _combined_deduped.txt
+  skipped.txt             # optional notes when a category had nothing to export
+_combined.txt             # (multi/all export) everything across all chats
+_combined_deduped.txt
 ```
+
+`_combined.txt` files flatten every file in a folder (and its subfolders) into a single text document with visual section markers — useful for sharing exported chat context. `_combined_deduped.txt` adds numbered paragraph IDs and replaces duplicate paragraphs with cross-references, reducing redundancy when the same content appears across multiple files. Combined files are only generated for folders containing 2 or more text files.
 
 When visible thinking/status panels are exported, each block becomes a numbered markdown file under `thinking/`, plus a `thinking_index.json` manifest. Partial captures during an in-progress response are marked with a `_partial` suffix. Status panel files include `expanded` / `collapsed` metadata when detectable.
 
@@ -72,6 +86,16 @@ Attachment and content-block excerpts are also included **inline in `chat.md`** 
 - Visible thinking export captures what Claude shows in the UI, not hidden or encrypted reasoning
 - Large bulk exports can take time; progress and cancel are available in the popup. Bulk exports with **Visible thinking** visit each chat in the browser (~3–5 seconds per chat) to capture status panels.
 - Not affiliated with or endorsed by Anthropic
+
+### Future: smarter context compression
+
+The `_combined_deduped.txt` files currently use paragraph-level deduplication (normalized exact-match, similar to `consolidate_and_dedupe.py`). Future improvements could include:
+
+- Semantic similarity deduplication (not just exact/normalized match)
+- LLM-friendly summarization of repeated boilerplate
+- Token-count-aware truncation for specific context windows
+- Cross-chat deduplication in multi-export combined files
+- Structural compression (collapsing similar frontmatter blocks, repeated headers)
 
 ## Troubleshooting
 
