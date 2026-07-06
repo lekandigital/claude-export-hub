@@ -82,7 +82,7 @@ Attachment and content-block excerpts are also included **inline in `chat.md`** 
 
 - Claude's UI and API can change without notice; exports may need updates
 - Collapsed status panels may export title-only placeholders when body text is not rendered in the DOM
-- DOM artifact cards (for example PDF preview tiles) are not downloaded as binaries unless the API payload includes extractable text
+- Some DOM artifact cards or attachments may export as metadata-only placeholders if the API payload lacks both readable text and a safe download URL
 - Visible thinking export captures what Claude shows in the UI, not hidden or encrypted reasoning
 - Large bulk exports can take time; progress and cancel are available in the popup. Bulk exports with **Visible thinking** visit each chat in the browser (~3–5 seconds per chat) to capture status panels.
 - Not affiliated with or endorsed by Anthropic
