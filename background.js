@@ -869,35 +869,163 @@ function writeThinkingToZip(zip, folderPrefix, thinkingItems) {
 
 function writeFileCategoryToZip(zip, folderPrefix, subfolder, items) {
   if (!items.length) {
-    return { fileCount: 0, indexEntries: [] };
+    return Promise.resolve({ fileCount: 0, indexEntries: [] });
   }
 
-  let fileCount = 0;
-  const usedNames = new Set();
-  const indexEntries = [];
+  const CLAUDE_DOWNLOAD_DOMAINS = new Set([
+    "claude.ai",
+    "api.claude.ai",
+  ]);
 
-  for (const item of items) {
+  function isClaudeSafeUrl(url) {
+    try {
+      const parsed = new URL(url);
+      return CLAUDE_DOWNLOAD_DOMAINS.has(parsed.hostname);
+    } catch {
+      return false;
+    }
+  }
+
+  const BINARY_EXTENSIONS = new Set([
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif",
+    ".pdf", ".zip", ".gz", ".tar",
+    ".mp4", ".mov", ".webm", ".mp3", ".wav", ".ogg",
+    ".ico", ".bmp", ".tiff", ".svg",
+  ]);
+
+  const usedNames = new Set();
+
+  async function processItem(item) {
+    const fileId = item.fileId || null;
+    const mimeType = item.mimeType || null;
+    const size = item.size ?? null;
+    const urls = item.urls || [];
+    const metadataOnly = !!item.metadataOnly;
+
+    let exportKind = "text";
+    let downloadAttempted = false;
+    let downloadSucceeded = false;
+    let fallbackReason = null;
+    let fileContent = item.content;
+    let itemLanguage = item.language;
+
+    // Determine extension for naming
+    const inferredExt = CadExportCore.getFileExtension(itemLanguage);
+    const titleAlreadyHasExt = CadExportCore.titleHasExtension(item.title, inferredExt);
+
+    // For metadata-only items with URLs, attempt binary download
+    if (metadataOnly && urls.length > 0) {
+      const safeUrls = urls.filter(isClaudeSafeUrl);
+      for (const url of safeUrls) {
+        downloadAttempted = true;
+        try {
+          const response = await fetch(url, {
+            credentials: "include",
+            headers: { Accept: "*/*" },
+          });
+          if (response.ok) {
+            const blob = await response.arrayBuffer();
+            if (blob.byteLength > 0) {
+              // Determine binary filename
+              const binaryExt = mimeType
+                ? CadExportCore.getFileExtension(mimeType)
+                : inferredExt;
+              const baseName = sanitizeFilename(item.title).replace(/[^\w\-._]+/g, "_");
+              const alreadyHasBinaryExt = CadExportCore.titleHasExtension(item.title, binaryExt);
+              const ext = alreadyHasBinaryExt ? "" : binaryExt;
+              let fileName = `${(item.messageIndex ?? 0) + 1}_${baseName}${ext}`;
+              if (usedNames.has(fileName)) {
+                let suffix = 1;
+                while (usedNames.has(fileName)) {
+                  fileName = `${(item.messageIndex ?? 0) + 1}_${baseName}_${suffix}${ext}`;
+                  suffix++;
+                }
+              }
+              usedNames.add(fileName);
+
+              zip.file(`${folderPrefix}${subfolder}/${fileName}`, blob);
+              exportKind = "binary";
+              downloadSucceeded = true;
+
+              return {
+                fileCount: 1,
+                indexEntry: {
+                  path: `${subfolder}/${fileName}`,
+                  title: item.title,
+                  source: item.source || null,
+                  category: item.category || subfolder,
+                  messageIndex: item.messageIndex ?? null,
+                  exportKind,
+                  fileId,
+                  mimeType,
+                  size,
+                  urlCount: urls.length,
+                  downloadAttempted,
+                  downloadSucceeded,
+                  metadataOnly,
+                },
+              };
+            }
+          }
+          fallbackReason = `HTTP ${response.status}`;
+        } catch (err) {
+          fallbackReason = err.message || "download failed";
+        }
+      }
+      if (!downloadSucceeded && safeUrls.length === 0 && urls.length > 0) {
+        fallbackReason = "no Claude-domain URLs";
+      }
+    }
+
+    if (metadataOnly) {
+      exportKind = "metadata";
+    }
+
+    // Write text or metadata markdown
     const fileName = getUniqueFileName(
       item.title,
-      item.language,
+      metadataOnly ? "markdown" : item.language,
       item.messageIndex ?? 0,
       usedNames,
     );
-    zip.file(`${folderPrefix}${subfolder}/${fileName}`, item.content);
-    fileCount++;
-    indexEntries.push({
-      path: `${subfolder}/${fileName}`,
-      title: item.title,
-      source: item.source || null,
-      category: item.category || subfolder,
-      messageIndex: item.messageIndex ?? null,
-    });
+    zip.file(`${folderPrefix}${subfolder}/${fileName}`, fileContent);
+
+    return {
+      fileCount: 1,
+      indexEntry: {
+        path: `${subfolder}/${fileName}`,
+        title: item.title,
+        source: item.source || null,
+        category: item.category || subfolder,
+        messageIndex: item.messageIndex ?? null,
+        exportKind,
+        fileId,
+        mimeType,
+        size,
+        urlCount: urls.length,
+        downloadAttempted,
+        downloadSucceeded,
+        fallbackReason,
+        metadataOnly,
+      },
+    };
   }
 
-  return { fileCount, indexEntries };
+  return (async () => {
+    let fileCount = 0;
+    const indexEntries = [];
+
+    for (const item of items) {
+      const result = await processItem(item);
+      fileCount += result.fileCount;
+      indexEntries.push(result.indexEntry);
+    }
+
+    return { fileCount, indexEntries };
+  })();
 }
 
-function writeStructuredChatToZip(
+async function writeStructuredChatToZip(
   zip,
   payload,
   exportIncludes,
@@ -950,7 +1078,7 @@ function writeStructuredChatToZip(
     ];
 
     for (const [subfolder, items] of categoryWrites) {
-      const result = writeFileCategoryToZip(
+      const result = await writeFileCategoryToZip(
         zip,
         folderPrefix,
         subfolder,
@@ -1050,7 +1178,7 @@ async function addChatToZip(zip, payload, options) {
     debug: true,
   });
 
-  let result = writeStructuredChatToZip(
+  let result = await writeStructuredChatToZip(
     zip,
     normalized,
     exportIncludes,
@@ -1071,7 +1199,7 @@ async function addChatToZip(zip, payload, options) {
           { visitForDom: false },
         );
       }
-      result = writeStructuredChatToZip(
+      result = await writeStructuredChatToZip(
         zip,
         rawSupplement.payload,
         exportIncludes,
@@ -1119,6 +1247,13 @@ const COMBINED_TOP = "┌" + "─".repeat(52);
 const COMBINED_BOT = "└" + "─".repeat(52);
 
 function collectZipTextFiles(zip, folderPath) {
+  const BINARY_SKIP_EXTENSIONS = new Set([
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif",
+    ".pdf", ".zip", ".gz", ".tar",
+    ".mp4", ".mov", ".webm", ".mp3", ".wav", ".ogg",
+    ".ico", ".bmp", ".tiff", ".svg",
+  ]);
+
   const prefix = folderPath ? (folderPath.endsWith("/") ? folderPath : folderPath + "/") : "";
   const files = [];
 
@@ -1134,6 +1269,11 @@ function collectZipTextFiles(zip, folderPath) {
       return;
     }
     if (name.endsWith(".json")) {
+      return;
+    }
+    // Skip binary files from combined text
+    const extMatch = name.match(/\.[^./]+$/);
+    if (extMatch && BINARY_SKIP_EXTENSIONS.has(extMatch[0].toLowerCase())) {
       return;
     }
     files.push({ path: relativePath, localPath: name });
