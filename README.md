@@ -87,15 +87,10 @@ Attachment and content-block excerpts are also included **inline in `chat.md`** 
 - Large bulk exports can take time; progress and cancel are available in the popup. Bulk exports with **Visible thinking** visit each chat in the browser (~3–5 seconds per chat) to capture status panels.
 - Not affiliated with or endorsed by Anthropic
 
-### Future: smarter context compression
+## Future features
 
-The `_combined_deduped.txt` files currently use paragraph-level deduplication (normalized exact-match, similar to `consolidate_and_dedupe.py`). Future improvements could include:
-
-- Semantic similarity deduplication (not just exact/normalized match)
-- LLM-friendly summarization of repeated boilerplate
-- Token-count-aware truncation for specific context windows
-- Cross-chat deduplication in multi-export combined files
-- Structural compression (collapsing similar frontmatter blocks, repeated headers)
+- **Advanced context compression**: Implement smarter ways to compress context from generated combined files beyond simple paragraph-level deduplication. Future improvements could include semantic similarity deduplication, LLM-friendly summarization of repeated boilerplate, token-count-aware truncation, cross-chat deduplication, and structural compression.
+- **Comprehensive attachment extraction**: Fully extract and parse text from document attachments (such as PDFs, Markdown, and text files) while leaving images and other non-text media assets unaltered.
 
 ## Troubleshooting
 
