@@ -514,8 +514,9 @@ function buildChatFolderPrefix(payload) {
 }
 
 function buildChatMarkdown(payload) {
-  const messages = getActiveBranchMessages(payload);
-  const lines = [`# ${payload.name || "Untitled Chat"}`, ""];
+  const normalized = normalizeChatPayload(payload) || payload;
+  const messages = getActiveBranchMessages(normalized);
+  const lines = [`# ${normalized.name || "Untitled Chat"}`, ""];
 
   for (const message of messages) {
     const sender = message.sender === "human" ? "Human" : "Assistant";
@@ -2329,6 +2330,35 @@ async function fetchPayloadViaPageEventBridge(tabId, uuid, options = {}) {
             );
           }
 
+          // MAIN-world code cannot see CadExportCore: lib/export-core.js is
+          // loaded as a content script (isolated world). Sniff the payload
+          // shape inline here; the service worker does the real normalization.
+          function sniffMessages(raw) {
+            if (!raw || typeof raw !== "object") {
+              return null;
+            }
+            const candidates = [
+              raw,
+              raw.conversation,
+              raw.data,
+              raw.result,
+              raw.payload,
+              raw.chat_conversation,
+              raw.data?.conversation,
+              raw.data?.chat_conversation,
+              raw.result?.conversation,
+            ].filter(Boolean);
+            for (const candidate of candidates) {
+              if (Array.isArray(candidate.chat_messages)) {
+                return candidate.chat_messages;
+              }
+              if (Array.isArray(candidate.messages)) {
+                return candidate.messages;
+              }
+            }
+            return null;
+          }
+
           function chatOrgs(data) {
             const orgs = Array.isArray(data)
               ? data
@@ -2398,13 +2428,13 @@ async function fetchPayloadViaPageEventBridge(tabId, uuid, options = {}) {
                   continue;
                 }
                 const json = await response.json();
-                const normalized = CadExportCore.normalizeChatPayload(json);
-                if (normalized) {
+                const sniffed = sniffMessages(json);
+                if (sniffed) {
                   dispatch({
-                    payload: normalized,
+                    payload: json,
                     rawUrl: absoluteUrl,
                     orgCount: orgIds.length,
-                    messageCount: normalized.chat_messages.length,
+                    messageCount: sniffed.length,
                   });
                   return;
                 }
@@ -2429,7 +2459,10 @@ async function fetchPayloadViaPageEventBridge(tabId, uuid, options = {}) {
       if (result.rawUrl) {
         storeChatFetchMeta(uuid, result.rawUrl);
       }
-      return { payload: result.payload };
+      // The MAIN-world bridge dispatches the raw API JSON (it cannot reach
+      // CadExportCore), so normalize here before handing it to callers that
+      // expect a canonical payload with chat_messages.
+      return { payload: normalizeChatPayload(result.payload) };
     }
 
     return {

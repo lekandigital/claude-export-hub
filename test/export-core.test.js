@@ -257,3 +257,173 @@ describe("buildExportDiagnostics", () => {
     assert.ok(diagnostics.skipped.some((item) => item.category === "thinking"));
   });
 });
+
+describe("role-shaped payloads", () => {
+  it("backfills sender from role when tree linkage is present", () => {
+    const normalized = Core.normalizeChatPayload({
+      uuid: SAMPLE_UUID,
+      name: "Role Chat",
+      messages: [
+        {
+          uuid: "a",
+          parent_message_uuid: ROOT_UUID,
+          role: "user",
+          content: [{ type: "text", text: "hello" }],
+          created_at: "2024-01-01T00:00:00Z",
+        },
+        {
+          uuid: "b",
+          parent_message_uuid: "a",
+          role: "assistant",
+          content: [{ type: "text", text: "hi back" }],
+          created_at: "2024-01-02T00:00:00Z",
+        },
+      ],
+    });
+
+    assert.ok(normalized);
+    assert.deepEqual(
+      normalized.chat_messages.map((m) => m.sender),
+      ["human", "assistant"],
+    );
+    // original role is preserved
+    assert.deepEqual(
+      normalized.chat_messages.map((m) => m.role),
+      ["user", "assistant"],
+    );
+  });
+
+  it("resolves the active branch in order for role-shaped payloads", () => {
+    const payload = {
+      uuid: SAMPLE_UUID,
+      messages: [
+        {
+          uuid: "a",
+          parent_message_uuid: ROOT_UUID,
+          role: "user",
+          content: [{ type: "text", text: "q" }],
+          created_at: "2024-01-01T00:00:00Z",
+        },
+        {
+          uuid: "b",
+          parent_message_uuid: "a",
+          role: "assistant",
+          content: [{ type: "text", text: "a" }],
+          created_at: "2024-01-02T00:00:00Z",
+        },
+      ],
+    };
+
+    const branch = Core.getActiveBranchMessages(payload);
+    assert.equal(branch.length, 2);
+    assert.deepEqual(
+      branch.map((m) => m.sender),
+      ["human", "assistant"],
+    );
+  });
+
+  it("falls back to array order when no message carries tree linkage", () => {
+    const payload = {
+      uuid: SAMPLE_UUID,
+      messages: [
+        { uuid: "a", role: "user", content: [{ type: "text", text: "one" }] },
+        { uuid: "b", role: "assistant", content: [{ type: "text", text: "two" }] },
+        { uuid: "c", role: "user", content: [{ type: "text", text: "three" }] },
+      ],
+    };
+
+    const branch = Core.getActiveBranchMessages(payload);
+    assert.equal(branch.length, 3);
+    assert.deepEqual(
+      branch.map((m) => m.uuid),
+      ["a", "b", "c"],
+    );
+  });
+
+  it("still returns [] when linkage exists but no root resolves", () => {
+    const payload = {
+      uuid: SAMPLE_UUID,
+      messages: [
+        // parent points at a message that is not in the payload, and no root
+        { uuid: "a", parent_message_uuid: "missing", role: "user", text: "x" },
+      ],
+    };
+
+    assert.deepEqual(Core.getActiveBranchMessages(payload), []);
+  });
+
+  it("collects pasted content from role-shaped human messages", () => {
+    const long = "p".repeat(200);
+    const payload = {
+      uuid: SAMPLE_UUID,
+      messages: [
+        {
+          uuid: "a",
+          parent_message_uuid: ROOT_UUID,
+          role: "user",
+          content: [{ type: "text", text: long }],
+          created_at: "2024-01-01T00:00:00Z",
+        },
+      ],
+    };
+
+    const items = Core.collectCategorizedItemsFromPayload(payload);
+    assert.equal(items.pasted.length, 1);
+    assert.ok(items.pasted[0].content.includes("p"));
+  });
+
+  it("collects thinking from role-shaped assistant messages", () => {
+    const payload = {
+      uuid: SAMPLE_UUID,
+      messages: [
+        {
+          uuid: "a",
+          parent_message_uuid: ROOT_UUID,
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "working through it" },
+            { type: "text", text: "answer" },
+          ],
+          created_at: "2024-01-01T00:00:00Z",
+        },
+      ],
+    };
+
+    const thinking = Core.collectThinkingFromPayload(payload);
+    assert.equal(thinking.length, 1);
+  });
+
+  it("never overwrites an explicit sender with an inconsistent role", () => {
+    const normalized = Core.normalizeChatPayload({
+      uuid: SAMPLE_UUID,
+      messages: [
+        {
+          uuid: "a",
+          parent_message_uuid: ROOT_UUID,
+          sender: "assistant",
+          role: "user",
+          text: "x",
+        },
+      ],
+    });
+
+    assert.equal(normalized.chat_messages[0].sender, "assistant");
+  });
+
+  it("reports a specific diagnostic when the branch resolves to zero", () => {
+    const payload = {
+      uuid: SAMPLE_UUID,
+      messages: [
+        { uuid: "a", parent_message_uuid: "missing", role: "user", text: "x" },
+      ],
+    };
+
+    const diagnostics = Core.buildExportDiagnostics(payload, { domBlocks: [] });
+    assert.equal(diagnostics.messages, 0);
+    const transcriptSkip = diagnostics.skipped.find(
+      (item) => item.category === "transcript",
+    );
+    assert.ok(transcriptSkip);
+    assert.match(transcriptSkip.reason, /active branch resolved to 0/);
+  });
+});
