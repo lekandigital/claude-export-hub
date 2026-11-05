@@ -5,7 +5,9 @@
   "description": "Chrome extension for exporting Claude.ai conversations",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "test:fixtures": "node --test test/fixtures.test.js"
+    "test:fixtures": "node --test test/fixtures.test.js",
+    "test:browser": "node scripts/chrome-smoke.js",
+    "test:integration": "node --test test/integration.test.js"
   },
   "devDependencies": {
     "jsdom": "^26.1.0"

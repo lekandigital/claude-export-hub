@@ -1049,11 +1049,14 @@ async function writeStructuredChatToZip(
 
   if (exportIncludes.transcript) {
     if (messages.length === 0) {
+      const totalMessages = (normalized.chat_messages || []).length;
       skipped.push(
         createCategorySkipRecord(
           normalized,
           "transcript",
-          "No messages on active branch",
+          totalMessages
+            ? `Payload has ${totalMessages} message(s) but the active branch resolved to 0 (tree linkage missing or broken?)`
+            : "No messages on active branch",
         ),
       );
     } else {
