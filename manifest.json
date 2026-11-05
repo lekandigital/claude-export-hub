@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Export Hub",
-  "version": "2.0",
+  "version": "2.1",
   "description": "Export Claude chats, transcripts, artifacts, pasted content, and optional visible thinking as organized ZIP archives",
   "permissions": [
     "tabs",
@@ -9,7 +9,8 @@
     "storage",
     "webRequest",
     "scripting",
-    "notifications"
+    "notifications",
+    "unlimitedStorage"
   ],
   "host_permissions": [
     "https://claude.ai/*",
@@ -28,6 +29,15 @@
         "banner.js",
         "lib/export-core.js",
         "content.js"
+      ]
+    },
+    {
+      "run_at": "document_start",
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "automation.js"
       ]
     }
   ],

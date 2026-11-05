@@ -291,6 +291,10 @@ async function loadConversations() {
 
 searchInput.addEventListener("input", renderChatList);
 
+document.getElementById("open-full-archive").addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("archive.html") });
+});
+
 selectVisibleBtn.addEventListener("click", () => {
   for (const conv of getFilteredConversations()) {
     selectedUuids.add(conv.uuid);

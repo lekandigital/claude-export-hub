@@ -1,1 +1,4 @@
 node_modules/
+automation-token.txt
+archive-hints.json
+__pycache__/

@@ -2552,3 +2552,41 @@ async function ensureChatPayload(uuid, tabId) {
   console.warn(LOG_PREFIX, "active fetch failed for", uuid, detail);
   return { payload: null, error: summary || "unknown" };
 }
+
+// ── Automation (see automation.js) ──────────────────────────────────
+
+async function readAutomationToken() {
+  try {
+    const response = await fetch(chrome.runtime.getURL("automation-token.txt"));
+    return response.ok ? (await response.text()).trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+chrome.runtime.onMessage.addListener((request, sender) => {
+  if (request.action !== "automationCommand") return;
+  (async () => {
+    const token = await readAutomationToken();
+    const params = request.params || {};
+    if (token.length < 16 || params.ceh !== token) {
+      console.warn(LOG_PREFIX, "Ignored automation command with a bad token");
+      return;
+    }
+    if (sender.tab?.id !== undefined) {
+      await chrome.tabs.remove(sender.tab.id).catch(() => {});
+    }
+    if (params.cmd === "reload") {
+      chrome.runtime.reload();
+    } else if (params.cmd === "archive") {
+      const query = new URLSearchParams({ auto: "1" });
+      for (const key of ["root", "uuids", "extra", "force", "probe"]) {
+        if (params[key]) query.set(key, params[key]);
+      }
+      await chrome.tabs.create({
+        url: chrome.runtime.getURL(`archive.html?${query}`),
+        active: false,
+      });
+    }
+  })();
+});

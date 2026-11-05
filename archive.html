@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Claude Export Hub — Full archive</title>
+    <style>
+      :root {
+        --bg: #faf9f5;
+        --fg: #1f1e1d;
+        --muted: #6b6a66;
+        --line: #e3e1d9;
+        --accent: #c96442;
+        --panel: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1f1e1d;
+          --fg: #f0eee6;
+          --muted: #a3a19a;
+          --line: #3a3936;
+          --accent: #d97757;
+          --panel: #2a2927;
+        }
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      main {
+        max-width: 860px;
+        margin: 0 auto;
+        padding: 28px 20px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0 0 4px;
+      }
+      p {
+        color: var(--muted);
+        margin: 0 0 16px;
+      }
+      label {
+        display: block;
+        font-weight: 600;
+        margin: 14px 0 6px;
+      }
+      input[type="text"],
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--fg);
+        font: inherit;
+      }
+      textarea {
+        height: 64px;
+        font-family: ui-monospace, Menlo, monospace;
+        font-size: 12px;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin: 16px 0;
+      }
+      button {
+        padding: 8px 14px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .check {
+        display: inline-flex;
+        gap: 6px;
+        align-items: center;
+        font-weight: normal;
+        margin: 0;
+      }
+      .bar {
+        height: 8px;
+        border-radius: 4px;
+        background: var(--line);
+        overflow: hidden;
+      }
+      #progress-fill {
+        height: 100%;
+        width: 0;
+        background: var(--accent);
+        transition: width 0.3s;
+      }
+      #summary {
+        margin: 8px 0 12px;
+        font-variant-numeric: tabular-nums;
+      }
+      #log {
+        height: 420px;
+        overflow: auto;
+        margin: 0;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        font: 12px/1.45 ui-monospace, Menlo, monospace;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Full archive</h1>
+      <p>
+        Saves every chat into its own folder under Downloads: raw
+        <code>conversation.json</code> (all branches), <code>transcript.md</code>,
+        <code>thinking.md</code>, <code>pasted/</code>, <code>uploads/</code>,
+        <code>outputs/</code>, <code>artifacts/</code> and a
+        <code>manifest.json</code> listing anything that failed. Re-running skips
+        chats that have not changed. Keep this tab open while it runs.
+      </p>
+
+      <label for="root">Folder inside Downloads</label>
+      <input type="text" id="root" value="Claude Full Archive" />
+
+      <label for="uuids">Only these chats (links or IDs, optional)</label>
+      <textarea id="uuids" placeholder="https://claude.ai/chat/…"></textarea>
+
+      <div class="row">
+        <button type="button" class="primary" id="run-all">Archive every chat</button>
+        <button type="button" id="run-some">Archive listed chats</button>
+        <button type="button" id="stop" disabled>Stop</button>
+        <label class="check"><input type="checkbox" id="force" /> Redo chats already archived</label>
+      </div>
+
+      <div class="bar"><div id="progress-fill"></div></div>
+      <div id="summary">Idle</div>
+      <pre id="log"></pre>
+    </main>
+    <script src="lib/export-core.js"></script>
+    <script src="archive.js"></script>
+  </body>
+</html>

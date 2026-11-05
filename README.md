@@ -18,6 +18,63 @@ Claude Export Hub fetches conversation data from Claude's own API using your exi
 
 Use the extension popup for all three modes. A floating in-page control on chat pages exports the current conversation quickly.
 
+## Full archive (complete backup)
+
+**All chats → "Full archive"** in the popup opens `archive.html`, which writes every chat straight into `Downloads/Claude Full Archive/` — no ZIP, no save dialogs:
+
+```
+Claude Full Archive/
+  _index.md / _index.json       # every chat with per-category counts
+  _conversations.json           # the chat list as the API returned it
+  _status.json                  # live progress + recent log (rewritten every ~15 s)
+  _projects/<name>/             # project.json, instructions.md, docs/, files/
+  2026-05-21 Chat title [a1b2c3d4]/
+    conversation.json           # raw API payload, every branch, thinking, tool calls
+    transcript.md               # main branch, thinking + pasted text inline
+    branches.md                 # edited/retried branches (when any)
+    thinking.md                 # every thinking block
+    pasted/                     # pasted text and text attachments
+    uploads/                    # your files, original bytes (/files/{id}/contents or sandbox)
+    outputs/                    # files Claude made (wiggle sandbox; text rebuilt from the chat if expired)
+    tool-images/                # images returned inside tool results
+    created-files/              # other create_file targets, rebuilt from the chat
+    artifacts/                  # final version of each artifact
+    manifest.json               # every file, how it was fetched, and anything that failed
+```
+
+How it works: API calls run inside a background claude.ai tab (same session as the site), files are written with `chrome.downloads`, and finished chats are remembered per folder so a rerun only redoes new or changed chats. Image previews (`.preview.webp`) are used only when an original is unavailable.
+
+Incognito (temporary) chats never appear in Claude's chat lists. Recent ones can still be fetched by ID: add their links to the "Only these chats" box, or pass them as `extra`. Older ones are purged by Claude and return 404.
+
+After the chats, two more passes run: every file in the account's file list (`/account/files`) that no chat folder already has is saved into that chat's `file-versions/` (earlier versions of rewritten files, files from deleted branches) or `_account-files/`.
+
+### Using Claude's official data export as a map
+
+The official export (Settings → Privacy → Export data) lists every chat and file but only names the files. Use it to tell the archiver where to look, then fold it in:
+
+```bash
+python3 -I scripts/hints-from-official-export.py "<unzipped export dir>"   # writes archive-hints.json (git-ignored)
+# run the Full archive — it loads archive-hints.json automatically and also tries
+# every hinted chat, file ID (/files/{id}/contents, then preview) and project by ID
+python3 -I scripts/merge-official-export.py "$HOME/Downloads/Claude Full Archive" "<unzipped export dir>"
+```
+
+The merge step adds `_official-export-only/` (chats Claude no longer serves, rebuilt from the export), `_official-export/` (projects, memories, design chats, published artifacts, Claude Code cloud) and `_coverage.md`, which accounts for every chat, file, thinking block and pasted text in the export. `_hint-files.json` and `_account-files.json` record each file ID's outcome; runs limited to selected chats write `.selected.json` versions instead.
+
+### Driving it from a script
+
+Create `automation-token.txt` (git-ignored, 16+ random characters) in the extension folder and reload the extension. Then opening these URLs in Chrome runs commands (the token stops web pages from triggering anything):
+
+```bash
+T=$(cat automation-token.txt)
+open -g "https://claude.ai/#ceh=$T&cmd=reload"                                   # reload the extension
+open -g "https://claude.ai/#ceh=$T&cmd=archive"                                  # archive everything
+open -g "https://claude.ai/#ceh=$T&cmd=archive&uuids=<id>,<id>&root=Test&force=1" # selected chats
+open -g "https://claude.ai/#ceh=$T&cmd=archive&extra=<incognito id>,…"           # plus unlisted chats
+```
+
+Watch `Downloads/<root>/_status.json` for progress.
+
 ## Include options
 
 Each export uses checkboxes:
